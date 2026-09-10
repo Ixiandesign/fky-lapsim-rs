@@ -7,6 +7,13 @@ pub struct Metrics {
     pub kpi_deg: f64,
     pub scrub_radius_m: Option<f64>,
     pub mechanical_trail_m: Option<f64>,
+    pub rest_upper_front_leg_m: f64,
+    pub rest_upper_rear_leg_m: f64,
+    pub rest_lower_front_leg_m: f64,
+    pub rest_lower_rear_leg_m: f64,
+    pub rest_tie_rod_m: f64,
+    pub rest_pushrod_m: f64,
+    pub rest_shock_length_m: f64,
     pub shock_length_m: f64,
     pub shock_compression_m: f64,
     /// Shock compression per metre of upward wheel-center motion at fixed chassis/rack.
@@ -16,7 +23,7 @@ pub struct Metrics {
     pub lower_arm_angle_rad: f64,
     pub rocker_angle_rad: f64,
 }
-pub(crate) fn measure(c: &crate::Corner, p: &crate::Points, angles: [f64; 3]) -> Metrics {
+pub fn measure(c: &crate::Corner, p: &crate::Points, angles: [f64; 3]) -> Metrics {
     use crate::kinematics::v;
     let side = match c.id {
         crate::CornerId::FrontLeft | crate::CornerId::RearLeft => 1.0,
@@ -41,8 +48,19 @@ pub(crate) fn measure(c: &crate::Corner, p: &crate::Points, angles: [f64; 3]) ->
         toe_deg: -side * heading.y.atan2(heading.x).to_degrees(),
         caster_deg: -k.x.atan2(k.z).to_degrees(),
         kpi_deg: -side * k.y.atan2(k.z).to_degrees(),
-        scrub_radius_m: intersection.map(|i| side * (contact.y - i.y)),
-        mechanical_trail_m: intersection.map(|i| i.x - contact.x),
+        scrub_radius_m: intersection.filter(|_| heading.norm() > 1e-12).map(|i| {
+            (contact - i).dot(&(nalgebra::Vector3::z().cross(&heading.normalize()) * side))
+        }),
+        mechanical_trail_m: intersection
+            .filter(|_| heading.norm() > 1e-12)
+            .map(|i| (i - contact).dot(&heading.normalize())),
+        rest_upper_front_leg_m: (v(c.upper_ball) - v(c.upper_front)).norm(),
+        rest_upper_rear_leg_m: (v(c.upper_ball) - v(c.upper_rear)).norm(),
+        rest_lower_front_leg_m: (v(c.lower_ball) - v(c.lower_front)).norm(),
+        rest_lower_rear_leg_m: (v(c.lower_ball) - v(c.lower_rear)).norm(),
+        rest_tie_rod_m: (v(c.steering_outer) - v(c.steering_inner)).norm(),
+        rest_pushrod_m: (v(c.pushrod_pickup) - v(c.rocker_pushrod)).norm(),
+        rest_shock_length_m: (v(c.rocker_shock) - v(c.shock_chassis)).norm(),
         shock_length_m: shock,
         shock_compression_m: (v(c.rocker_shock) - v(c.shock_chassis)).norm() - shock,
         motion_ratio: None,

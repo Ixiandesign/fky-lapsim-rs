@@ -24,6 +24,7 @@ pub struct CornerState {
     pub id: CornerId,
     pub points: Points,
     pub orientation: [f64; 4],
+    pub contact_ambiguity: Option<String>,
     pub metrics: Metrics,
     pub max_residual_m: f64,
     pub iterations: usize,
@@ -84,15 +85,54 @@ pub(crate) enum Constraint {
     Road(Frame, f64),
     WorldHeight(Frame, f64),
 }
-fn contact(center: V, axis: V, radius: f64) -> V {
-    let z = V::z();
-    let down = z - axis * axis.z;
+fn rack_offset(c: &Corner, rack: f64) -> V {
+    (v(c.rack_axis[1]) - v(c.rack_axis[0])).normalize() * rack
+}
+fn contact(center: V, axis: V, c: &Corner) -> V {
+    let down = V::z() - axis * axis.z;
     let n = down.norm();
-    // A horizontal disk has an entire bottom face; its center is a valid contact point.
-    if n < 1e-14 {
-        center
+    let radial = if n < 1e-14 && c.tire_profile == crate::TireProfile::Torus {
+        axis.cross(&V::y()).normalize()
+    } else if n < 1e-14 {
+        V::zeros()
     } else {
-        center - down * (radius / n)
+        down / n
+    };
+    match c.tire_profile {
+        crate::TireProfile::Disk => center - radial * c.tire_radius,
+        crate::TireProfile::Cylinder => {
+            center
+                - radial * c.tire_radius
+                - axis
+                    * (c.tire_width / 2.0)
+                    * if axis.z.abs() < 1e-14 {
+                        0.0
+                    } else {
+                        axis.z.signum()
+                    }
+        }
+        crate::TireProfile::Torus => {
+            center - radial * (c.tire_radius - c.tire_width / 2.0) - V::z() * (c.tire_width / 2.0)
+        }
+    }
+}
+fn contact_ambiguity(c: &Corner, axis: V) -> Option<String> {
+    if axis.z.abs() > 1.0 - 1e-12 {
+        Some(
+            if c.tire_profile == crate::TireProfile::Torus {
+                "vertical axle: torus ring support is nonunique; representative ring point selected"
+            } else {
+                "vertical axle: radial support is nonunique; center of support set selected"
+            }
+            .into(),
+        )
+    } else if c.tire_profile == crate::TireProfile::Cylinder && axis.z.abs() < 1e-12 {
+        Some(
+            "horizontal cylinder axle: contact line midpoint selected; support has a camber cusp"
+                .into(),
+        )
+    } else {
+        None
     }
 }
 fn residual(c: &Corner, p: &Pose, rack: f64, goal: &Constraint) -> R6 {
@@ -112,7 +152,7 @@ fn residual(c: &Corner, p: &Pose, rack: f64, goal: &Constraint) -> R6 {
     {
         let moved = v(a)
             + if i == 4 {
-                V::new(0.0, rack, 0.0)
+                rack_offset(c, rack)
             } else {
                 V::zeros()
             };
@@ -124,25 +164,34 @@ fn residual(c: &Corner, p: &Pose, rack: f64, goal: &Constraint) -> R6 {
         Constraint::Road(f, height) => {
             let center = f.point(p.point(c, c.wheel_center));
             let axis = f.rotation * p.q * (v(c.spindle_axis[1]) - v(c.spindle_axis[0])).normalize();
-            contact(center, axis, c.tire_radius).z - height
+            contact(center, axis, c).z - height
         }
     };
     r
 }
 fn newton(c: &Corner, pose: &mut Pose, rack: f64, goal: &Constraint) -> Result<usize, Error> {
+    newton_tolerance(c, pose, rack, goal, 1e-8)
+}
+fn newton_tolerance(
+    c: &Corner,
+    pose: &mut Pose,
+    rack: f64,
+    goal: &Constraint,
+    tolerance: f64,
+) -> Result<usize, Error> {
     for iteration in 0..80 {
         let r = residual(c, pose, rack, goal);
         if !r.iter().all(|x| x.is_finite()) {
             return Err(err("nonfinite closure residual"));
         }
-        if r.amax() <= 1e-8 {
+        if r.amax() <= tolerance {
             // With an axial inner tie joint, rotation about the kingpin leaves all
             // five link constraints unchanged. If that axis is vertical in the
             // constraint frame, both wheel height and disk support height are
             // unchanged too: this is an actual free DOF, not an isolated toggle.
             let lower = pose.point(c, c.lower_ball);
             let kingpin = (pose.point(c, c.upper_ball) - lower).normalize();
-            let inner = v(c.steering_inner) + V::new(0.0, rack, 0.0);
+            let inner = v(c.steering_inner) + rack_offset(c, rack);
             let vertical = match goal {
                 Constraint::Jounce(_) => V::z(),
                 Constraint::Road(frame, _) | Constraint::WorldHeight(frame, _) => {
@@ -293,7 +342,7 @@ fn state(
         lower_rear: fixed(c.lower_rear),
         upper_ball: moving(c.upper_ball),
         lower_ball: moving(c.lower_ball),
-        steering_inner: f.point(v(c.steering_inner) + V::new(0.0, rack, 0.0)).into(),
+        steering_inner: f.point(v(c.steering_inner) + rack_offset(c, rack)).into(),
         steering_outer: moving(c.steering_outer),
         wheel_center: moving(c.wheel_center),
         spindle_axis: c.spindle_axis.map(moving),
@@ -309,7 +358,7 @@ fn state(
         contact_point: [0.0; 3],
     };
     let axis = (v(points.spindle_axis[1]) - v(points.spindle_axis[0])).normalize();
-    points.contact_point = contact(v(points.wheel_center), axis, c.tire_radius).into();
+    points.contact_point = contact(v(points.wheel_center), axis, c).into();
     let metrics = crate::metrics::measure(c, &points, [ua, la, ra]);
     let q = f.rotation * p.q;
     let q = q.quaternion();
@@ -322,6 +371,7 @@ fn state(
     }
     Ok(CornerState {
         id: c.id,
+        contact_ambiguity: contact_ambiguity(c, axis),
         points,
         orientation: [q.w, q.i, q.j, q.k],
         metrics,
@@ -393,4 +443,31 @@ pub fn solve_corner(c: &Corner, jounce: f64, rack: f64) -> Result<CornerState, E
     continuation(c, steps as usize, |t| {
         (rack * t, Constraint::Jounce(jounce * t))
     })
+}
+
+/// Reclose about an already solved branch, with strict residuals for derivative analysis.
+pub(crate) fn at_world_height(
+    c: &Corner,
+    s: &CornerState,
+    frame: &Frame,
+    rack: f64,
+    z: f64,
+) -> Result<CornerState, Error> {
+    let [w, x, y, zq] = s.orientation;
+    let mut pose = Pose {
+        q: frame.rotation.inverse()
+            * UnitQuaternion::new_normalize(nalgebra::Quaternion::new(w, x, y, zq)),
+        t: frame.rotation.inverse() * (v(s.points.wheel_center) - frame.translation)
+            - v(c.wheel_center),
+    };
+    let goal = Constraint::WorldHeight(frame.clone(), z);
+    let iterations = newton_tolerance(c, &mut pose, rack, &goal, 1e-12)?;
+    state(
+        c,
+        &pose,
+        rack,
+        &goal,
+        s.metrics.rocker_angle_rad,
+        iterations,
+    )
 }

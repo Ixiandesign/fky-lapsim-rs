@@ -72,6 +72,18 @@ impl Default for Chassis {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TireProfile {
+    #[default]
+    Disk,
+    Cylinder,
+    Torus,
+}
+fn default_rack_axis() -> [Point; 2] {
+    [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Corner {
     pub id: CornerId,
@@ -87,7 +99,11 @@ pub struct Corner {
     /// Two distinct points define the spindle axis (direction has no sign convention).
     pub spindle_axis: [Point; 2],
     pub tire_radius: f64,
-    /// Stored for visualization; initial contact model is a zero-width rigid disk.
+    #[serde(default)]
+    pub tire_profile: TireProfile,
+    #[serde(default = "default_rack_axis")]
+    pub rack_axis: [Point; 2],
+    /// Full width for cylinder/torus envelopes.
     pub tire_width: f64,
     pub pushrod_body: PushrodBody,
     pub pushrod_pickup: Point,
@@ -172,6 +188,8 @@ impl Project {
                 spindle_axis: [p(0.0, 0.8, 0.3), p(0.0, 1.0, 0.3)],
                 tire_radius: 0.3,
                 tire_width: 0.2,
+                tire_profile: TireProfile::Disk,
+                rack_axis: default_rack_axis(),
                 pushrod_body: PushrodBody::LowerArm,
                 pushrod_pickup: p(0.0, 0.7, 0.3),
                 rocker_axis: [p(-0.1, 0.4, 0.8), p(0.1, 0.4, 0.8)],
@@ -235,6 +253,8 @@ impl Corner {
     pub fn validate(&self) -> Result<(), Error> {
         let c = self;
         let points = [
+            c.rack_axis[0],
+            c.rack_axis[1],
             c.upper_front,
             c.upper_rear,
             c.lower_front,
@@ -258,6 +278,7 @@ impl Corner {
             format!("{:?}: nonfinite hardpoint", c.id),
         )?;
         for (label, a, b) in [
+            ("rack axis", c.rack_axis[0], c.rack_axis[1]),
             ("upper axis", c.upper_front, c.upper_rear),
             ("lower axis", c.lower_front, c.lower_rear),
             ("spindle axis", c.spindle_axis[0], c.spindle_axis[1]),
@@ -303,6 +324,10 @@ impl Corner {
                 format!("{:?}: {label} must be finite and positive", c.id),
             )?;
         }
+        require(
+            c.tire_profile != TireProfile::Torus || c.tire_width / 2.0 < c.tire_radius,
+            "torus requires half width smaller than outer radius",
+        )?;
         for (label, v) in [
             ("preload", c.spring_damper.preload),
             ("compression damping", c.spring_damper.compression_damping),
