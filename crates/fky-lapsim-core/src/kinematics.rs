@@ -207,7 +207,9 @@ fn rocker(c: &Corner, pickup: V, previous: f64) -> Result<f64, Error> {
     let amplitude = aa.hypot(bb);
     if amplitude < 1e-14 {
         if cc.abs() < 1e-12 {
-            return Ok(previous);
+            return Err(err(
+                "underdetermined rocker: pushrod length does not constrain angle",
+            ));
         }
         return Err(err("pushrod cannot reach rocker"));
     }

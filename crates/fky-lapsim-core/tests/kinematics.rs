@@ -120,6 +120,15 @@ fn analytic_rest_motion_ratio() {
     assert!((s.metrics.motion_ratio.unwrap() - 0.1875 / 0.085_f64.sqrt()).abs() < 1e-5);
 }
 #[test]
+fn unconstrained_rocker_returns_explicit_error() {
+    let mut c = Project::example().corners[0].clone();
+    c.pushrod_body = PushrodBody::Knuckle;
+    c.pushrod_pickup = [1.3, 0.4, 0.8];
+    c.validate().unwrap();
+    let error = solve_corner(&c, 0.0, 0.0).unwrap_err();
+    assert!(error.message.contains("underdetermined rocker"));
+}
+#[test]
 fn signed_design_alignment() {
     let mut c = Project::example().corners[0].clone();
     c.upper_ball[0] -= 0.03;
