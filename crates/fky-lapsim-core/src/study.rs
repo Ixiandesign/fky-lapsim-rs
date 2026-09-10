@@ -36,7 +36,16 @@ pub(crate) fn simulate_on_road_mode(
     road_heights: [f64; 4],
     measure_motion_ratio: bool,
 ) -> Result<VehicleState, Error> {
-    use crate::kinematics::{continuation_mode, err, v, Constraint, Frame, V};
+    simulate_on_road_tolerance(p, m, road_heights, measure_motion_ratio, 1e-8)
+}
+pub(crate) fn simulate_on_road_tolerance(
+    p: &Project,
+    m: &Motion,
+    road_heights: [f64; 4],
+    measure_motion_ratio: bool,
+    tolerance: f64,
+) -> Result<VehicleState, Error> {
+    use crate::kinematics::{continuation_tolerance, err, v, Constraint, Frame, V};
     use nalgebra::UnitQuaternion;
     p.validate()?;
     if ![m.heave, m.roll, m.pitch, m.rack_front, m.rack_rear]
@@ -67,7 +76,7 @@ pub(crate) fn simulate_on_road_mode(
             _ => m.rack_rear,
         };
         corners.push(
-            continuation_mode(
+            continuation_tolerance(
                 c,
                 steps as usize,
                 |t| {
@@ -87,6 +96,7 @@ pub(crate) fn simulate_on_road_mode(
                     )
                 },
                 measure_motion_ratio,
+                tolerance,
             )
             .map_err(|e| err(&format!("{:?}: {}", c.id, e)))?,
         );

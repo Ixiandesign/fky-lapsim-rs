@@ -392,6 +392,15 @@ pub(crate) fn continuation_mode(
     goal: impl Fn(f64) -> (f64, Constraint),
     measure_motion_ratio: bool,
 ) -> Result<CornerState, Error> {
+    continuation_tolerance(c, steps, goal, measure_motion_ratio, 1e-8)
+}
+pub(crate) fn continuation_tolerance(
+    c: &Corner,
+    steps: usize,
+    goal: impl Fn(f64) -> (f64, Constraint),
+    measure_motion_ratio: bool,
+    tolerance: f64,
+) -> Result<CornerState, Error> {
     c.validate()?;
     let mut pose = Pose {
         q: UnitQuaternion::identity(),
@@ -402,7 +411,7 @@ pub(crate) fn continuation_mode(
     let mut result = None;
     for i in 0..=steps {
         let (rack, target) = goal(i as f64 / steps as f64);
-        total += newton(c, &mut pose, rack, &target)?;
+        total += newton_tolerance(c, &mut pose, rack, &target, tolerance)?;
         let s = state(c, &pose, rack, &target, rocker_angle, total)?;
         rocker_angle = s.metrics.rocker_angle_rad;
         result = Some(s);

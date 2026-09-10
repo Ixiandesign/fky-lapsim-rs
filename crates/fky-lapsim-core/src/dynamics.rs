@@ -3,12 +3,21 @@
 //! q = [heave m, roll rad, pitch rad], rotating Ry(pitch)Rx(roll) about chassis COM.
 //! Compression derivatives come from exact geometry closure, with finite-difference
 //! refinement. RK4 is conditionally stable: check timestep convergence for each setup.
-//! Component/unsprung inertia and contact release require a separate model.
+//! Select retained component inertia explicitly; contact release remains unsupported.
 use crate::{Chassis, SpringDamper};
 use crate::{CornerId, Error, Project};
 use serde::{Deserialize, Serialize};
 
 pub const MODEL_FIDELITY: &str = "nonlinear_sprung_body_fixed_contact_massless_links";
+pub const COMPONENT_MODEL_FIDELITY: &str =
+    "nonlinear_rigid_arm_rocker_nonspinning_knuckle_inertia_prescribed_fixed_contact";
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RideMode {
+    #[default]
+    Reduced,
+    RetainedComponentInertia,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoadInput {
@@ -35,6 +44,13 @@ pub enum RoadInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RideRequest {
+    pub mode: RideMode,
+    /// Fixed rack travel in metres for the complete ride.
+    pub rack_front: f64,
+    pub rack_rear: f64,
+    /// Coarse central difference step, metres for translations/radians for angles.
+    /// Mass mode verifies half-step acceleration and support reaction convergence.
+    pub derivative_step: f64,
     pub duration_s: f64,
     pub dt_s: f64,
     /// Offsets from equilibrium when solve_equilibrium is true, otherwise absolute.
@@ -50,6 +66,10 @@ pub struct RideRequest {
 impl Default for RideRequest {
     fn default() -> Self {
         Self {
+            mode: RideMode::Reduced,
+            rack_front: 0.,
+            rack_rear: 0.,
+            derivative_step: 0.001,
             duration_s: 1.,
             dt_s: 0.005,
             initial_displacement: [0.; 3],
@@ -69,12 +89,12 @@ pub struct RideSample {
     pub compression_m: [f64; 4],
     pub compression_velocity_m_s: [f64; 4],
     pub shock_force_n: [f64; 4],
-    /// Vertical reactions of this reduced prescribed-support model only.
+    /// Vertical prescribed-support reactions, including retained component inertia in mass mode.
     pub support_reaction_n: [f64; 4],
     pub energy_j: f64,
     /// Positive integral of signed damper force times compression velocity.
     pub dissipated_work_j: f64,
-    /// Integral of reduced vertical support reactions times prescribed road velocity.
+    /// Integral of the selected model's support reactions times prescribed road velocity.
     pub support_work_j: f64,
     pub external_work_j: f64,
     pub energy_balance_error_j: f64,
@@ -97,7 +117,8 @@ pub struct RideRun {
     pub termination: Option<RideTermination>,
 }
 /// Integrate coupled heave/roll/pitch using RK4 and exact nonlinear ground closure.
-/// Links and unsprung parts are massless; supports are rigid horizontal planes.
+/// Reduced mode omits component inertia; retained mode includes configured bodies.
+/// Supports are rigid horizontal planes in both modes.
 /// Tire compliance/friction/spin, horizontal/yaw motion and contact release are absent.
 /// Geometry failure means loss of solver validity, not a calibrated physical bump stop.
 /// Negative support below -1e-6 N terminates contact validity. Stage failures are
@@ -113,7 +134,12 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
         None
     };
     let mut run = RideRun {
-        model_fidelity: MODEL_FIDELITY.into(),
+        model_fidelity: if r.mode == RideMode::Reduced {
+            MODEL_FIDELITY
+        } else {
+            COMPONENT_MODEL_FIDELITY
+        }
+        .into(),
         corner_ids: p.corners.each_ref().map(|c| c.id),
         equilibrium,
         samples: Vec::new(),
@@ -232,6 +258,21 @@ fn event(p: &Project, time_s: f64, last_valid_time_s: Option<f64>, e: Error) -> 
     }
 }
 fn validate_request(r: &RideRequest) -> Result<(), Error> {
+    if !r.rack_front.is_finite()
+        || !r.rack_rear.is_finite()
+        || !r.derivative_step.is_finite()
+        || !(0.0001..=0.004).contains(&r.derivative_step)
+    {
+        return Err(error(
+            "invalid rack travel or mass derivative step (allowed 0.0001..0.004)",
+        ));
+    }
+    if r.mode == RideMode::RetainedComponentInertia && matches!(r.road, RoadInput::Histories { .. })
+    {
+        return Err(error(
+            "component inertia requires C1 road: piecewise linear histories have velocity jumps",
+        ));
+    }
     if ![r.duration_s, r.dt_s]
         .iter()
         .chain(r.initial_displacement.iter())
@@ -364,23 +405,48 @@ fn road_at(p: &Project, road: &RoadInput, t: f64, left: bool) -> ([f64; 4], [f64
     }
     (z, zd)
 }
-fn compression(p: &Project, q: [f64; 3], z: [f64; 4]) -> Result<[f64; 4], Error> {
+fn compression(
+    p: &Project,
+    q: [f64; 3],
+    z: [f64; 4],
+    rack: [f64; 2],
+    tight: bool,
+) -> Result<[f64; 4], Error> {
     let m = crate::Motion {
         heave: q[0],
         roll: q[1],
         pitch: q[2],
-        ..Default::default()
+        rack_front: rack[0],
+        rack_rear: rack[1],
     };
-    Ok(crate::study::simulate_on_road_mode(p, &m, z, false)?
+    Ok(
+        crate::study::simulate_on_road_tolerance(
+            p,
+            &m,
+            z,
+            false,
+            if tight { 1e-12 } else { 1e-8 },
+        )?
         .corners
-        .map(|c| c.metrics.shock_compression_m))
+        .map(|c| c.metrics.shock_compression_m),
+    )
 }
 fn compression_map(
     p: &Project,
     q: [f64; 3],
     z: [f64; 4],
 ) -> Result<([f64; 4], [[f64; 3]; 4]), Error> {
-    let c = compression(p, q, z)?;
+    compression_map_request(p, q, z, &RideRequest::default())
+}
+fn compression_map_request(
+    p: &Project,
+    q: [f64; 3],
+    z: [f64; 4],
+    r: &RideRequest,
+) -> Result<([f64; 4], [[f64; 3]; 4]), Error> {
+    let rack = [r.rack_front, r.rack_rear];
+    let tight = r.mode == RideMode::RetainedComponentInertia;
+    let c = compression(p, q, z, rack, tight)?;
     let mut j = [[0.; 3]; 4];
     // Refined central differences detect reachability failures and nonsmooth branches.
     // Steps exceed closure tolerance; ratios are never silently extrapolated.
@@ -391,8 +457,8 @@ fn compression_map(
             let mut qm = q;
             qp[a] += eps;
             qm[a] -= eps;
-            let cp = compression(p, qp, z)?;
-            let cm = compression(p, qm, z)?;
+            let cp = compression(p, qp, z, rack, tight)?;
+            let cm = compression(p, qm, z, rack, tight)?;
             for i in 0..4 {
                 let derivative = (cp[i] - cm[i]) / (2. * eps);
                 if !derivative.is_finite()
@@ -425,7 +491,11 @@ fn evaluate(
     let q = [y[0], y[1], y[2]];
     let v = [y[3], y[4], y[5]];
     let (z, zd) = road_at(p, &r.road, t, left);
-    let (c, j) = compression_map(p, q, z)?;
+    let (c, j) = compression_map_request(p, q, z, r)?;
+    check_limits(p, c)?;
+    if r.mode == RideMode::RetainedComponentInertia && crate::mass::active(p) {
+        return evaluate_components(p, r, t, y, q, v, z, zd, c, j);
+    }
     let mut u = [0.; 4];
     let mut force = [0.; 4];
     let mut support = [0.; 4];
@@ -476,18 +546,211 @@ fn evaluate(
         energy_balance_error_j: 0.,
     })
 }
+fn check_limits(p: &Project, c: [f64; 4]) -> Result<(), Error> {
+    for (i, corner) in p.corners.iter().enumerate() {
+        let rest = (nalgebra::Vector3::from(corner.rocker_shock)
+            - nalgebra::Vector3::from(corner.shock_chassis))
+        .norm();
+        let length = rest - c[i];
+        if corner
+            .spring_damper
+            .min_length_m
+            .is_some_and(|min| length < min)
+        {
+            return Err(error(format!(
+                "{:?}: shock minimum length reached",
+                corner.id
+            )));
+        }
+        if corner
+            .spring_damper
+            .max_length_m
+            .is_some_and(|max| length > max)
+        {
+            return Err(error(format!(
+                "{:?}: shock maximum length reached",
+                corner.id
+            )));
+        }
+    }
+    Ok(())
+}
+fn road_acceleration(road: &RoadInput, z: [f64; 4]) -> [f64; 4] {
+    let omega = match road {
+        RoadInput::Sine { frequency_hz, .. } => std::f64::consts::TAU * frequency_hz,
+        RoadInput::SpatialSine {
+            speed_m_s,
+            wavelength_m,
+            ..
+        } => std::f64::consts::TAU * speed_m_s / wavelength_m,
+        _ => 0.,
+    };
+    z.map(|z| -omega * omega * z)
+}
+#[allow(clippy::too_many_arguments)]
+fn evaluate_components(
+    p: &Project,
+    r: &RideRequest,
+    t: f64,
+    y: [f64; 9],
+    q: [f64; 3],
+    v: [f64; 3],
+    z: [f64; 4],
+    zd: [f64; 4],
+    c: [f64; 4],
+    j: [[f64; 3]; 4],
+) -> Result<RideSample, Error> {
+    use crate::mass::{Terms, X};
+    let x = X::from_row_slice(&[q[0], q[1], q[2], z[0], z[1], z[2], z[3]]);
+    let w = X::from_row_slice(&[v[0], v[1], v[2], zd[0], zd[1], zd[2], zd[3]]);
+    let zdd = road_acceleration(&r.road, z);
+    let u = std::array::from_fn(|i| (0..3).map(|a| j[i][a] * v[a]).sum::<f64>() - j[i][0] * zd[i]);
+    let force = std::array::from_fn(|i| {
+        spring_force(&p.corners[i].spring_damper, c[i])
+            + damper_force(&p.corners[i].spring_damper, u[i])
+    });
+    let compute = |mut terms: Terms| -> Result<([f64; 3], [f64; 4], f64), Error> {
+        let ch = &p.chassis;
+        let a = ch.inertia[1] * q[1].cos().powi(2) + ch.inertia[2] * q[1].sin().powi(2);
+        let ap = 2. * (ch.inertia[2] - ch.inertia[1]) * q[1].sin() * q[1].cos();
+        terms.mass[(0, 0)] += ch.sprung_mass;
+        terms.mass[(1, 1)] += ch.inertia[0];
+        terms.mass[(2, 2)] += a;
+        terms.gravity[0] += ch.sprung_mass * GRAVITY;
+        terms.bias[1] -= 0.5 * ap * v[2] * v[2];
+        terms.bias[2] += ap * v[1] * v[2];
+        let mut rhs = nalgebra::Vector3::from(r.external_force);
+        for k in 0..3 {
+            rhs[k] -= terms.gravity[k]
+                + terms.bias[k]
+                + (0..4)
+                    .map(|i| j[i][k] * force[i] + terms.mass[(k, 3 + i)] * zdd[i])
+                    .sum::<f64>();
+        }
+        let acc = terms
+            .mass
+            .fixed_view::<3, 3>(0, 0)
+            .into_owned()
+            .cholesky()
+            .ok_or_else(|| error("component Mqq is not positive definite"))?
+            .solve(&rhs);
+        let support = std::array::from_fn(|i| {
+            terms.gravity[3 + i] + terms.bias[3 + i] - j[i][0] * force[i]
+                + (0..3).map(|k| terms.mass[(3 + i, k)] * acc[k]).sum::<f64>()
+                + (0..4)
+                    .map(|k| terms.mass[(3 + i, 3 + k)] * zdd[k])
+                    .sum::<f64>()
+        });
+        let energy = 0.5 * w.dot(&(terms.mass * w))
+            + terms.potential
+            + ch.sprung_mass * GRAVITY * q[0]
+            + (0..4)
+                .map(|i| spring_energy(&p.corners[i].spring_damper, c[i]))
+                .sum::<f64>();
+        Ok((acc.into(), support, energy))
+    };
+    // Cache exact stencil positions within this stage only, preserving branch-local solves.
+    let cache = std::cell::RefCell::new(std::collections::HashMap::new());
+    let provider = |x: X| {
+        let key = x.map(f64::to_bits);
+        if let Some(v) = cache.borrow().get(&key) {
+            return Ok(Vec::clone(v));
+        }
+        let poses = crate::mass::poses(p, [r.rack_front, r.rack_rear], x)?;
+        cache.borrow_mut().insert(key, poses.clone());
+        Ok(poses)
+    };
+    let coarse_terms = crate::mass::terms(provider, x, w, r.derivative_step)?;
+    let fine_terms = crate::mass::terms(provider, x, w, r.derivative_step / 2.)?;
+    let stable_j = coarse_terms.stable_jacobians(&fine_terms);
+    let coarse = compute(coarse_terms)?;
+    let close = |a: &([f64; 3], [f64; 4], f64), b: &([f64; 3], [f64; 4], f64)| {
+        (0..3).all(|i| (a.0[i] - b.0[i]).abs() <= 1e-4 + 2e-4 * b.0[i].abs())
+            && (0..4).all(|i| (a.1[i] - b.1[i]).abs() <= 0.1 + 2e-4 * b.1[i].abs())
+    };
+    let fine = compute(fine_terms.clone())?;
+    let accepted = if stable_j && close(&coarse, &fine) {
+        fine
+    } else {
+        let quarter_terms = crate::mass::terms(provider, x, w, r.derivative_step / 4.)?;
+        let stable_j = fine_terms.stable_jacobians(&quarter_terms);
+        let quarter = compute(quarter_terms)?;
+        if !stable_j || !close(&fine, &quarter) {
+            return Err(error(
+                "component mass derivative refinement failed acceleration/reaction tolerance",
+            ));
+        }
+        quarter
+    };
+    let (acceleration, support, energy) = accepted;
+    for (i, normal) in support.iter().enumerate() {
+        if *normal < -1e-6 {
+            return Err(error(format!(
+                "{:?}: fixed contact invalid: negative full support reaction {} N",
+                p.corners[i].id, support[i]
+            )));
+        }
+    }
+    if !energy.is_finite()
+        || !acceleration
+            .iter()
+            .chain(support.iter())
+            .all(|v| v.is_finite())
+    {
+        return Err(error("nonfinite component acceleration/support/energy"));
+    }
+    Ok(RideSample {
+        time_s: t,
+        displacement: q,
+        velocity: v,
+        acceleration,
+        compression_m: c,
+        compression_velocity_m_s: u,
+        shock_force_n: force,
+        support_reaction_n: support,
+        energy_j: energy,
+        dissipated_work_j: y[6],
+        support_work_j: y[7],
+        external_work_j: y[8],
+        energy_balance_error_j: 0.,
+    })
+}
 fn static_residual(
     p: &Project,
     r: &RideRequest,
     q: [f64; 3],
 ) -> Result<nalgebra::Vector3<f64>, Error> {
     let (z, _) = road_at(p, &r.road, 0., false);
-    let (c, j) = compression_map(p, q, z)?;
+    let (c, j) = compression_map_request(p, q, z, r)?;
+    let component_gravity = if r.mode == RideMode::RetainedComponentInertia
+        && crate::mass::active(p)
+    {
+        let x = crate::mass::X::from_row_slice(&[q[0], q[1], q[2], z[0], z[1], z[2], z[3]]);
+        let provider = |x| crate::mass::poses(p, [r.rack_front, r.rack_rear], x);
+        let coarse = crate::mass::terms(provider, x, crate::mass::X::zeros(), r.derivative_step)?;
+        let fine =
+            crate::mass::terms(provider, x, crate::mass::X::zeros(), r.derivative_step / 2.)?;
+        if !coarse.stable_jacobians(&fine)
+            || (0..7).any(|i| {
+                (coarse.gravity[i] - fine.gravity[i]).abs() > 0.001 + 1e-5 * fine.gravity[i].abs()
+            })
+        {
+            return Err(error(
+                "component gravity derivative refinement failed at equilibrium",
+            ));
+        }
+        fine.gravity
+    } else {
+        crate::mass::X::zeros()
+    };
     let mut residual = nalgebra::Vector3::new(
         p.chassis.sprung_mass * GRAVITY - r.external_force[0],
         -r.external_force[1],
         -r.external_force[2],
     );
+    for a in 0..3 {
+        residual[a] += component_gravity[a];
+    }
     for i in 0..4 {
         for a in 0..3 {
             residual[a] += j[i][a] * spring_force(&p.corners[i].spring_damper, c[i]);

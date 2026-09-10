@@ -23,6 +23,10 @@ pub enum PushrodBody {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpringDamper {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length_m: Option<f64>,
     /// Linear spring rate in N/m.
     pub spring_rate: f64,
     /// Positive compression preload in N at the design pose.
@@ -44,6 +48,8 @@ pub struct SpringDamper {
 impl Default for SpringDamper {
     fn default() -> Self {
         Self {
+            min_length_m: None,
+            max_length_m: None,
             spring_rate: 30000.0,
             preload: 0.0,
             compression_damping: 1500.0,
@@ -84,8 +90,28 @@ fn default_rack_axis() -> [Point; 2] {
     [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
 }
 
+/// COM is an absolute design-chassis coordinate. Inertia is about that COM,
+/// expressed in design-chassis axes (symmetric tensor, kg m²). Exclude these masses
+/// from chassis sprung_mass. Knuckle includes the wheel without wheel spin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BodyMass {
+    pub mass_kg: f64,
+    pub center_of_mass: Point,
+    pub inertia: [[f64; 3]; 3],
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComponentMasses {
+    pub upper_arm: Option<BodyMass>,
+    pub lower_arm: Option<BodyMass>,
+    pub knuckle: Option<BodyMass>,
+    pub rocker: Option<BodyMass>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Corner {
+    #[serde(default)]
+    pub component_masses: ComponentMasses,
     pub id: CornerId,
     pub upper_front: Point,
     pub upper_rear: Point,
@@ -175,6 +201,7 @@ impl Project {
         let corner = |id, x: f64, side: f64| {
             let p = |dx: f64, y: f64, z: f64| [x + dx, side * y, z];
             Corner {
+                component_masses: ComponentMasses::default(),
                 id,
                 upper_front: p(0.2, 0.4, 0.6),
                 upper_rear: p(-0.2, 0.4, 0.6),
@@ -252,6 +279,42 @@ fn triangle(a: Point, b: Point, c: Point) -> bool {
 impl Corner {
     pub fn validate(&self) -> Result<(), Error> {
         let c = self;
+        for (name, body) in [
+            ("upper arm", &c.component_masses.upper_arm),
+            ("lower arm", &c.component_masses.lower_arm),
+            ("knuckle", &c.component_masses.knuckle),
+            ("rocker", &c.component_masses.rocker),
+        ] {
+            if let Some(b) = body {
+                require(
+                    b.mass_kg.is_finite()
+                        && b.mass_kg >= 0.
+                        && b.center_of_mass
+                            .iter()
+                            .chain(b.inertia.iter().flatten())
+                            .all(|v| v.is_finite()),
+                    format!("{:?}: invalid {name} mass/COM/inertia", c.id),
+                )?;
+                if b.mass_kg > 0. {
+                    let m = nalgebra::Matrix3::from_fn(|i, j| b.inertia[i][j]);
+                    require(
+                        (m - m.transpose()).amax() <= 1e-12 * m.amax().max(1.),
+                        format!("{:?}: {name} inertia must be symmetric", c.id),
+                    )?;
+                    let e = m.symmetric_eigen().eigenvalues;
+                    require(e.min()>0. && e.max()/2.<=e.sum()/2.-e.max()/2.+1e-12*e.max(),format!("{:?}: {name} inertia must be positive and satisfy triangle inequalities",c.id))?;
+                }
+            }
+        }
+        let s = &c.spring_damper;
+        require(
+            s.min_length_m
+                .iter()
+                .chain(s.max_length_m.iter())
+                .all(|v| v.is_finite() && *v > 0.)
+                && !matches!((s.min_length_m,s.max_length_m),(Some(a),Some(b)) if a>b),
+            format!("{:?}: invalid shock length limits", c.id),
+        )?;
         let points = [
             c.rack_axis[0],
             c.rack_axis[1],
