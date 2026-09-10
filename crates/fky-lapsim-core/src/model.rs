@@ -30,6 +30,16 @@ pub struct SpringDamper {
     /// Viscous damping in N s/m.
     pub compression_damping: f64,
     pub rebound_damping: f64,
+    /// Optional [compression m, total spring force N] curve replaces rate/preload.
+    /// Piecewise linear, with constant force beyond endpoints; bilateral forces allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spring_curve: Option<Vec<[f64; 2]>>,
+    /// Optional [speed m/s, force magnitude N] curves replace viscous coefficients.
+    /// Start at [0,0], interpolate linearly, hold the last magnitude above the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_curve: Option<Vec<[f64; 2]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebound_curve: Option<Vec<[f64; 2]>>,
 }
 impl Default for SpringDamper {
     fn default() -> Self {
@@ -38,6 +48,9 @@ impl Default for SpringDamper {
             preload: 0.0,
             compression_damping: 1500.0,
             rebound_damping: 2000.0,
+            spring_curve: None,
+            compression_curve: None,
+            rebound_curve: None,
         }
     }
 }
@@ -299,6 +312,37 @@ impl Corner {
                 v.is_finite() && v >= 0.0,
                 format!("{:?}: {label} must be finite and nonnegative", c.id),
             )?;
+        }
+        for (name, curve, damper) in [
+            ("spring", &c.spring_damper.spring_curve, false),
+            (
+                "compression damper",
+                &c.spring_damper.compression_curve,
+                true,
+            ),
+            ("rebound damper", &c.spring_damper.rebound_curve, true),
+        ] {
+            if let Some(curve) = curve {
+                require(
+                    curve.len() >= 2
+                        && curve.len() <= 10000
+                        && curve.iter().flatten().all(|x| x.is_finite())
+                        && curve.windows(2).all(|w| {
+                            w[1][0] > w[0][0]
+                                && ((w[1][1] - w[0][1]) / (w[1][0] - w[0][0])).is_finite()
+                        }),
+                    format!("{:?}: invalid {name} force table", c.id),
+                )?;
+                if damper {
+                    require(
+                        curve[0] == [0.0, 0.0] && curve.iter().all(|p| p[0] >= 0.0 && p[1] >= 0.0),
+                        format!(
+                            "{:?}: {name} table must start at zero and remain passive",
+                            c.id
+                        ),
+                    )?;
+                }
+            }
         }
         Ok(())
     }

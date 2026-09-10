@@ -334,6 +334,14 @@ pub(crate) fn continuation(
     steps: usize,
     goal: impl Fn(f64) -> (f64, Constraint),
 ) -> Result<CornerState, Error> {
+    continuation_mode(c, steps, goal, true)
+}
+pub(crate) fn continuation_mode(
+    c: &Corner,
+    steps: usize,
+    goal: impl Fn(f64) -> (f64, Constraint),
+    measure_motion_ratio: bool,
+) -> Result<CornerState, Error> {
     c.validate()?;
     let mut pose = Pose {
         q: UnitQuaternion::identity(),
@@ -350,6 +358,9 @@ pub(crate) fn continuation(
         result = Some(s);
     }
     let mut result = result.ok_or_else(|| err("empty continuation"))?;
+    if !measure_motion_ratio {
+        return Ok(result);
+    }
     let (rack, target) = goal(1.0);
     let h = 1e-5;
     let perturbed = |dz: f64| -> Result<f64, Error> {

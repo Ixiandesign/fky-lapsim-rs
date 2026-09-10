@@ -28,7 +28,15 @@ pub fn simulate_on_road(
     m: &Motion,
     road_heights: [f64; 4],
 ) -> Result<VehicleState, Error> {
-    use crate::kinematics::{continuation, err, v, Constraint, Frame, V};
+    simulate_on_road_mode(p, m, road_heights, true)
+}
+pub(crate) fn simulate_on_road_mode(
+    p: &Project,
+    m: &Motion,
+    road_heights: [f64; 4],
+    measure_motion_ratio: bool,
+) -> Result<VehicleState, Error> {
+    use crate::kinematics::{continuation_mode, err, v, Constraint, Frame, V};
     use nalgebra::UnitQuaternion;
     p.validate()?;
     if ![m.heave, m.roll, m.pitch, m.rack_front, m.rack_rear]
@@ -58,22 +66,30 @@ pub fn simulate_on_road(
             crate::CornerId::FrontLeft | crate::CornerId::FrontRight => m.rack_front,
             _ => m.rack_rear,
         };
-        corners.push(continuation(c, steps as usize, |t| {
-            let rotation = UnitQuaternion::from_axis_angle(&V::y_axis(), m.pitch * t)
-                * UnitQuaternion::from_axis_angle(&V::x_axis(), m.roll * t);
-            let center = v(p.chassis.center_of_mass);
-            let translation = center - rotation * center + V::new(0.0, 0.0, m.heave * t);
-            (
-                rack * t,
-                Constraint::Road(
-                    Frame {
-                        rotation,
-                        translation,
-                    },
-                    road_heights[index] * t,
-                ),
+        corners.push(
+            continuation_mode(
+                c,
+                steps as usize,
+                |t| {
+                    let rotation = UnitQuaternion::from_axis_angle(&V::y_axis(), m.pitch * t)
+                        * UnitQuaternion::from_axis_angle(&V::x_axis(), m.roll * t);
+                    let center = v(p.chassis.center_of_mass);
+                    let translation = center - rotation * center + V::new(0.0, 0.0, m.heave * t);
+                    (
+                        rack * t,
+                        Constraint::Road(
+                            Frame {
+                                rotation,
+                                translation,
+                            },
+                            road_heights[index] * t,
+                        ),
+                    )
+                },
+                measure_motion_ratio,
             )
-        })?);
+            .map_err(|e| err(&format!("{:?}: {}", c.id, e)))?,
+        );
     }
     Ok(VehicleState {
         motion: *m,
