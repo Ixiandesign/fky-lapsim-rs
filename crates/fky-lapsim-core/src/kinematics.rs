@@ -136,6 +136,26 @@ fn newton(c: &Corner, pose: &mut Pose, rack: f64, goal: &Constraint) -> Result<u
             return Err(err("nonfinite closure residual"));
         }
         if r.amax() <= 1e-8 {
+            // With an axial inner tie joint, rotation about the kingpin leaves all
+            // five link constraints unchanged. If that axis is vertical in the
+            // constraint frame, both wheel height and disk support height are
+            // unchanged too: this is an actual free DOF, not an isolated toggle.
+            let lower = pose.point(c, c.lower_ball);
+            let kingpin = (pose.point(c, c.upper_ball) - lower).normalize();
+            let inner = v(c.steering_inner) + V::new(0.0, rack, 0.0);
+            let vertical = match goal {
+                Constraint::Jounce(_) => V::z(),
+                Constraint::Road(frame, _) | Constraint::WorldHeight(frame, _) => {
+                    frame.rotation.inverse() * V::z()
+                }
+            };
+            if (inner - lower).cross(&kingpin).norm() < 1e-10
+                && kingpin.cross(&vertical).norm() < 1e-10
+            {
+                return Err(err(
+                    "underdetermined steering: free rotation about vertical kingpin",
+                ));
+            }
             return Ok(iteration);
         }
         let mut j = SMatrix::<f64, 6, 6>::zeros();

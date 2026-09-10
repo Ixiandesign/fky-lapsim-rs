@@ -129,6 +129,29 @@ fn unconstrained_rocker_returns_explicit_error() {
     assert!(error.message.contains("underdetermined rocker"));
 }
 #[test]
+fn free_steering_returns_explicit_error() {
+    let mut c = Project::example().corners[0].clone();
+    c.steering_inner = [1.3, 0.8, 0.45];
+    c.validate().unwrap();
+    let error = solve_corner(&c, 0.0, 0.0).unwrap_err();
+    assert!(error.message.contains("underdetermined steering"));
+    let mut project = Project::example();
+    project.corners[0] = c;
+    assert!(simulate(&project, &Motion::default())
+        .unwrap_err()
+        .message
+        .contains("underdetermined steering"));
+}
+#[test]
+fn axial_tie_rod_can_be_constrained_by_wheel_height() {
+    let mut c = Project::example().corners[0].clone();
+    c.upper_ball[0] -= 0.03;
+    c.steering_inner = std::array::from_fn(|i| (c.upper_ball[i] + c.lower_ball[i]) / 2.0);
+    // A tilted kingpin rotates the offset wheel center vertically, so prescribed
+    // wheel height removes the steering freedom despite the axial inner tie joint.
+    solve_corner(&c, 0.0, 0.0).unwrap();
+}
+#[test]
 fn signed_design_alignment() {
     let mut c = Project::example().corners[0].clone();
     c.upper_ball[0] -= 0.03;
