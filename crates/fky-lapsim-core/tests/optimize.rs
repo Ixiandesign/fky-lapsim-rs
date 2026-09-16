@@ -670,3 +670,31 @@ fn ride_summary_rejects_nonfinite_duration() {
         assert!(ride_summary(&run, duration).is_err(), "accepted {duration}");
     }
 }
+#[test]
+fn combined_case_and_aggregate_failure_checkpoint_round_trips() {
+    let p = Project::example();
+    let mut r = request();
+    r.max_evaluations = 3;
+    r.targets[0].value = f64::MAX;
+    let mut aggregate = r.targets[0].clone();
+    aggregate.value = 10.;
+    aggregate.weight = f64::MAX;
+    r.targets.push(aggregate);
+    let mut s = OptimizationSession::start(&p, &r).unwrap();
+    s.advance(2, None).unwrap();
+    let json = s.checkpoint().unwrap();
+    let mut resumed = OptimizationSession::resume(&p, &r, &json)
+        .expect("optimizer must resume its own failed-candidate checkpoint");
+    let e = resumed.result().best_infeasible.unwrap().evaluation;
+    assert_eq!(e.completed_cases, 1);
+    assert_eq!(e.failed_cases, 1);
+    assert_eq!(e.failed_samples, 1);
+    assert_eq!(e.failures.len(), 1);
+    assert!(e.failures[0]
+        .reason
+        .contains("nonfinite objective aggregate"));
+    assert_eq!(e.case_status(0, 0), Some(CaseStatus::Failure));
+    resumed.advance(1, None).unwrap();
+    assert!(resumed.is_finished());
+    assert!(OptimizationSession::resume(&p, &r, &resumed.checkpoint().unwrap()).is_ok());
+}

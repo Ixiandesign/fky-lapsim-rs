@@ -703,11 +703,24 @@ fn evaluate(
         model_fidelity: None,
     };
     let fail = |e: &mut Evaluation, u, case: String, reason: String| {
-        e.failed_cases += 1;
         if let Ok(ci) = case.parse::<usize>() {
             let index = u * per + ci;
+            if e.failed_case_bits[index / 64] & (1u64 << (index % 64)) != 0 {
+                // Multiple diagnostics can describe one case; counters and the
+                // retained entry must still represent that case exactly once.
+                if let Some(failure) = e
+                    .failures
+                    .iter_mut()
+                    .find(|f| f.sample == u && f.case == case)
+                {
+                    failure.reason.push_str("; ");
+                    failure.reason.push_str(&reason);
+                }
+                return;
+            }
             e.failed_case_bits[index / 64] |= 1u64 << (index % 64);
         }
+        e.failed_cases += 1;
         if e.failures.len() < 32 {
             e.failures.push(Failure {
                 sample: u,
@@ -719,7 +732,6 @@ fn evaluate(
         }
     };
     for (ui, u) in plan.iter().enumerate() {
-        let failures_before = e.failed_cases;
         let mut vals: Vec<Vec<f64>> = vec![vec![]; r.targets.len()];
         let project = construct(p, r, x, u);
         for case in 0..per {
@@ -884,9 +896,6 @@ fn evaluate(
                 e.contributions[i] += t.weight * loss / plan.len() as f64;
             }
         }
-        if e.failed_cases > failures_before {
-            e.failed_samples += 1;
-        }
         if !e.complete {
             break;
         }
@@ -904,7 +913,6 @@ fn evaluate(
             "0".into(),
             "nonfinite objective aggregate".into(),
         );
-        e.failed_samples = e.failed_samples.max(1);
     }
     e.feasible = e.complete && e.failed_cases == 0 && e.violation == 0.;
     if e.complete && e.failed_cases == 0 {
@@ -924,9 +932,18 @@ fn evaluate(
                 "0".into(),
                 "nonfinite objective aggregate".into(),
             );
-            e.failed_samples = e.failed_samples.max(1);
         }
     }
+    // Include aggregate diagnostics added after the last sample without double
+    // counting samples that already contained a failure.
+    e.failed_samples = (0..plan.len())
+        .filter(|&u| {
+            (0..per).any(|case| {
+                let index = u * per + case;
+                e.failed_case_bits[index / 64] & (1u64 << (index % 64)) != 0
+            })
+        })
+        .count();
     e
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
