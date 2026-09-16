@@ -19,3 +19,4 @@ pub use analysis::{
     ProjectedCenter,
 };
 mod mass;
+pub mod optimize;
