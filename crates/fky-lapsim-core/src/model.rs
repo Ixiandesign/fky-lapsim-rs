@@ -39,7 +39,7 @@ pub struct SpringDamper {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spring_curve: Option<Vec<[f64; 2]>>,
     /// Optional [speed m/s, force magnitude N] curves replace viscous coefficients.
-    /// Start at [0,0], interpolate linearly, hold the last magnitude above the table.
+    /// Start at `[0,0]`, interpolate linearly, hold the last magnitude above the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_curve: Option<Vec<[f64; 2]>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

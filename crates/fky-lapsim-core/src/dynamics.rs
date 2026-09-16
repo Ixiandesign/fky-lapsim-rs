@@ -257,7 +257,8 @@ fn event(p: &Project, time_s: f64, last_valid_time_s: Option<f64>, e: Error) -> 
         reason: e.message,
     }
 }
-fn validate_request(r: &RideRequest) -> Result<(), Error> {
+/// Validate ride input and bounded work without running equilibrium or physics.
+pub fn validate_request(r: &RideRequest) -> Result<(), Error> {
     if !r.rack_front.is_finite()
         || !r.rack_rear.is_finite()
         || !r.derivative_step.is_finite()

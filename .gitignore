@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 .work/
+*.pyd
+*.pdb
+.pytest_cache/
+/target/wheels/
