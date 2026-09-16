@@ -1,32 +1,66 @@
+//! Quaternion tangent-space Newton-Raphson corner closure: solves one corner's rigid
+//! linkage for a commanded jounge/road/world-height goal and reports its solved
+//! points, orientation, and [crate::Metrics].
 use crate::{Corner, CornerId, Error, Metrics, Point};
 use serde::{Deserialize, Serialize};
+/// One corner's solved hardpoints, in the coordinate frame of the enclosing
+/// [CornerState] (chassis frame for [solve_corner], world frame for vehicle studies).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Points {
+    /// Upper wishbone's forward inner pivot (chassis-fixed; unmoved by the solve).
     pub upper_front: Point,
+    /// Upper wishbone's rearward inner pivot (chassis-fixed).
     pub upper_rear: Point,
+    /// Lower wishbone's forward inner pivot (chassis-fixed).
     pub lower_front: Point,
+    /// Lower wishbone's rearward inner pivot (chassis-fixed).
     pub lower_rear: Point,
+    /// Upper wishbone's outer ball joint at the solved pose.
     pub upper_ball: Point,
+    /// Lower wishbone's outer ball joint at the solved pose.
     pub lower_ball: Point,
+    /// Tie-rod's inner pickup at the solved pose, including commanded rack travel.
     pub steering_inner: Point,
+    /// Tie-rod's outer, knuckle-side pickup at the solved pose.
     pub steering_outer: Point,
+    /// Wheel center at the solved pose.
     pub wheel_center: Point,
+    /// Spindle axis endpoints at the solved pose (direction has no sign convention).
     pub spindle_axis: [Point; 2],
+    /// Pushrod pickup at the solved pose, on its owning body.
     pub pushrod_pickup: Point,
+    /// Rocker's chassis-fixed rotation axis endpoints (unmoved by the solve).
     pub rocker_axis: [Point; 2],
+    /// Rocker's pushrod attachment point at the solved rocker angle.
     pub rocker_pushrod: Point,
+    /// Rocker's shock attachment point at the solved rocker angle.
     pub rocker_shock: Point,
+    /// Shock's chassis-side attachment point (chassis-fixed).
     pub shock_chassis: Point,
+    /// Tire's ground/road support (contact representative) point at the solved pose.
     pub contact_point: Point,
 }
+/// One corner's complete solved state: hardpoints, knuckle orientation, derived
+/// [Metrics], and closure diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CornerState {
+    /// This corner's identity.
     pub id: CornerId,
+    /// Solved hardpoints; chassis frame from [solve_corner], world frame from
+    /// vehicle studies (`simulate`/`sweep`).
     pub points: Points,
+    /// Knuckle orientation as a unit quaternion `[w, x, y, z]`, relative to the
+    /// design pose, in the same frame as `points`.
     pub orientation: [f64; 4],
+    /// Set when the tire support point at this pose is not a unique/smooth
+    /// function of the axle direction (e.g. a vertical axle or a horizontal
+    /// cylinder axle); describes which representative point was selected.
     pub contact_ambiguity: Option<String>,
+    /// Alignment, rest-length, and linkage-angle metrics derived from `points`.
     pub metrics: Metrics,
+    /// Largest absolute link-length/goal residual at convergence, metres.
     pub max_residual_m: f64,
+    /// Newton iterations used by the final continuation step.
     pub iterations: usize,
 }
 impl CornerState {
@@ -441,6 +475,20 @@ pub(crate) fn continuation_tolerance(
     };
     Ok(result)
 }
+/// Solve one corner's rigid linkage for commanded wheel-center jounce relative to the
+/// chassis (positive raises the wheel center) and rack travel along `c.rack_axis`,
+/// both metres. Uses quaternion tangent-space Newton-Raphson with continuation from
+/// the design pose for large travel. Returned points are in the chassis frame.
+///
+/// ```rust
+/// use dw_core::{solve_corner, Project};
+///
+/// let project = Project::example();
+/// let corner = &project.corners[0];
+/// let state = solve_corner(corner, 0.01, 0.0)?;
+/// assert!(state.max_residual_m < 1e-6);
+/// # Ok::<(), dw_core::Error>(())
+/// ```
 pub fn solve_corner(c: &Corner, jounce: f64, rack: f64) -> Result<CornerState, Error> {
     if !jounce.is_finite() || !rack.is_finite() {
         return Err(err("motion must be finite"));

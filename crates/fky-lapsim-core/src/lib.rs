@@ -1,4 +1,6 @@
 //! Native suspension model and numerical engine. Coordinates and forces use SI units.
+#![warn(missing_docs)]
+
 pub mod dynamics;
 pub mod kinematics;
 pub mod metrics;

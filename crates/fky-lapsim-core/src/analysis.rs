@@ -1,9 +1,14 @@
 //! Optional expanded analysis; never called by a dynamics stage.
 use crate::{CornerId, Error, Motion, Project, VehicleState};
 use serde::{Deserialize, Serialize};
+/// A possibly-undefined derived quantity. Serializes as `{value, reason}`. An
+/// undefined intersection or failed derivative perturbation is not a zero-valued
+/// measurement: `value` is `None` and `reason` explains why.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionalValue<T> {
+    /// The computed value, or `None` if undefined/unavailable.
     pub value: Option<T>,
+    /// Explanation, present exactly when `value` is `None`.
     pub reason: Option<String>,
 }
 impl<T> OptionalValue<T> {
@@ -20,42 +25,86 @@ impl<T> OptionalValue<T> {
         }
     }
 }
+/// A projected front-view instantaneous center: the intersection of the projected
+/// normals to the upper/lower ball-joint velocities in the world y-z plane, or a
+/// direction when both centers project to lateral infinity. See [projected_center].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectedCenter {
+    /// Finite intersection point `[y, z]`, metres, when one exists.
     pub point_yz_m: Option<[f64; 2]>,
+    /// Direction `[y, z]` toward the center when it lies at infinity (parallel
+    /// projected normals).
     pub direction_yz: Option<[f64; 2]>,
+    /// Explanation, present whenever the center is undefined or at infinity.
     pub reason: Option<String>,
 }
+/// One corner's expanded geometry derivatives and projected instant center, from
+/// [analyze]/[analyze_with_step].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CornerAnalysis {
+    /// This corner's identity.
     pub id: CornerId,
+    /// Name of the independent coordinate these derivatives are taken with respect
+    /// to: upward world wheel-center z, at fixed chassis pose and rack.
     pub derivative_coordinate: String,
+    /// Central-difference step used for these derivatives, metres.
     pub derivative_step_m: f64,
+    /// Shock compression derivative with respect to upward world wheel-center
+    /// motion, chassis and rack held fixed.
     pub motion_ratio: OptionalValue<f64>,
+    /// Second derivative of shock compression with respect to the same coordinate, per metre.
     pub motion_ratio_gradient_per_m: OptionalValue<f64>,
+    /// Tangent wheel-rate including preload-dependent geometric stiffness; see
+    /// [crate::dynamics::wheel_rate].
     pub spring_wheel_rate_n_per_m: OptionalValue<f64>,
+    /// Camber gain, degrees per metre of upward wheel-center motion.
     pub camber_gain_deg_per_m: OptionalValue<f64>,
+    /// Toe gain, degrees per metre of upward wheel-center motion.
     pub toe_gain_deg_per_m: OptionalValue<f64>,
+    /// Projected front-view instantaneous center for this corner.
     pub projected_front_view_ic: ProjectedCenter,
+    /// Set when this corner's tire support point is not a unique/smooth function of
+    /// the axle direction at this pose; mirrors [crate::CornerState::contact_ambiguity].
     pub contact_ambiguity: Option<String>,
+    /// Scrub radius, metres; undefined under the same conditions as
+    /// [crate::Metrics::scrub_radius_m].
     pub scrub_radius_m: OptionalValue<f64>,
+    /// Mechanical trail, metres; undefined under the same conditions as
+    /// [crate::Metrics::mechanical_trail_m].
     pub mechanical_trail_m: OptionalValue<f64>,
 }
+/// One axle's track and geometric roll center, from [analyze]/[analyze_with_step].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxleAnalysis {
+    /// Signed world-y left-minus-right distance between wheel centers, metres.
     pub wheel_track_m: f64,
+    /// Signed world-y left-minus-right distance between contact points, metres.
     pub contact_track_m: f64,
+    /// Geometric (not force-based) roll center: intersection of left/right
+    /// contact-to-projected-center lines in the world y-z plane. See
+    /// [geometric_roll_center].
     pub geometric_roll_center_yz_m: OptionalValue<[f64; 2]>,
 }
+/// Complete expanded geometry analysis for one [Motion]: the underlying solved
+/// [VehicleState] plus per-corner derivatives/centers and per-axle track/roll-center
+/// results. Returned by [analyze]/[analyze_with_step].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Analysis {
+    /// The solved vehicle state this analysis was computed from.
     pub state: VehicleState,
+    /// Per-corner derivatives and projected instant center, in `state.corners` order.
     pub corners: [CornerAnalysis; 4],
+    /// Front-axle track and geometric roll center.
     pub front: AxleAnalysis,
+    /// Rear-axle track and geometric roll center.
     pub rear: AxleAnalysis,
+    /// Signed world-x front-minus-rear distance between left wheel centers, metres.
     pub left_wheelbase_m: f64,
+    /// Signed world-x front-minus-rear distance between right wheel centers, metres.
     pub right_wheelbase_m: f64,
+    /// Signed world-x front-minus-rear distance between left contact points, metres.
     pub left_contact_wheelbase_m: f64,
+    /// Signed world-x front-minus-rear distance between right contact points, metres.
     pub right_contact_wheelbase_m: f64,
 }
 /// Tangent stiffness including preload-dependent geometry.
@@ -158,9 +207,16 @@ pub fn geometric_roll_center(
     let t = cross(d, b) / det;
     OptionalValue::known([left_contact[0] + t * a[0], left_contact[1] + t * a[1]])
 }
+/// Solve `m` and compute [Analysis]: per-axle track/wheelbase, motion-ratio and
+/// camber/toe gradients, wheel rate, and projected instant/roll centers, using a
+/// default 0.2 mm wheel-height derivative step. See [analyze_with_step] to control
+/// that step explicitly.
 pub fn analyze(p: &Project, m: &Motion) -> Result<Analysis, Error> {
     analyze_with_step(p, m, 0.0002)
 }
+/// Like [analyze], with an explicit wheel-height derivative step `h` (metres, must be
+/// finite and in `1e-6..=0.01`) for refinement studies. Smaller values are not
+/// automatically more accurate; check sensitivity to `h` before trusting a gradient.
 pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Error> {
     use crate::kinematics::{at_world_height, err, v, Frame, V};
     use nalgebra::UnitQuaternion;

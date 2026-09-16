@@ -1,7 +1,15 @@
 [package]
 name = "dw-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Rigid-body kinematics, geometry analysis, ride dynamics, and optimization for double-wishbone suspension systems."
+readme = "README.md"
+keywords = ["suspension", "vehicle-dynamics", "kinematics", "motorsport", "fsae"]
+categories = ["science", "simulation", "mathematics"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

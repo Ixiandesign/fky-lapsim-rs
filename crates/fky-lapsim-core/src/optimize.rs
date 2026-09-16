@@ -10,73 +10,139 @@ use std::{
 fn err(s: impl Into<String>) -> Error {
     Error { message: s.into() }
 }
+/// How a [Variable] may range: a bounded continuous value, or a fixed choice among
+/// named enum-like values (see [Variable] for the paths this applies to).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VariableKind {
-    Continuous { lower: f64, upper: f64 },
-    Discrete { choices: Vec<String> },
+    /// A physically bounded numeric leaf; `lower`/`upper` must be finite with `lower <= upper`.
+    Continuous {
+        /// Inclusive lower bound.
+        lower: f64,
+        /// Inclusive upper bound.
+        upper: f64,
+    },
+    /// A discrete choice among named values (only `pushrod_body` and `tire_profile` paths).
+    Discrete {
+        /// Permitted values, e.g. `["upper_arm", "lower_arm", "knuckle"]`.
+        choices: Vec<String>,
+    },
 }
+/// One design variable: a registered numeric-leaf path (see [parameter_registry]) and
+/// how it may range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Variable {
+    /// A path from [parameter_registry].
     pub path: String,
     #[serde(flatten)]
+    /// Continuous bounds or discrete choices; see [VariableKind].
     pub kind: VariableKind,
 }
+/// A linked coordinate: `destination = source * factor + offset`, applied after a
+/// candidate's independent variables are assigned and after uncertainty perturbation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relation {
+    /// A registered path this relation reads from.
     pub source: String,
+    /// A registered path this relation writes to; must not also be a [Variable] or
+    /// another relation's destination.
     pub destination: String,
+    /// Multiplier applied to the source value.
     pub factor: f64,
+    /// Constant added after multiplying by `factor`.
     pub offset: f64,
 }
+/// How a [Target]'s normalized error is combined across scenarios/uncertainty samples.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Aggregation {
+    /// Average of the squared normalized error across all cases.
     MeanSquared,
+    /// The single worst squared normalized error across all cases.
     WorstSquared,
 }
+/// An optimization objective: drive one metric toward a value (or per-scenario values),
+/// weighted and normalized by `scale`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
+    /// Corner this metric is read from; `None` for an axle/vehicle-level metric.
     pub corner: Option<CornerId>,
+    /// A name from [metric_registry].
     pub metric: String,
+    /// Desired value, used when `values` is absent (the same target for every scenario).
     pub value: f64,
+    /// Per-scenario desired values, in scenario order; overrides `value` when present.
     pub values: Option<Vec<f64>>,
+    /// Positive normalization scale, in the metric's own units; the error size that
+    /// counts as one unit of normalized error.
     pub scale: f64,
+    /// Nonnegative weight applied to this target's normalized error relative to others.
     pub weight: f64,
+    /// How this target's error is aggregated across scenarios/uncertainty; see [Aggregation].
     pub aggregation: Aggregation,
 }
+/// A hard feasibility limit on one metric: `min <= metric <= max` (either bound optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Constraint {
+    /// Corner this metric is read from; `None` for an axle/vehicle-level metric.
     pub corner: Option<CornerId>,
+    /// A name from [metric_registry].
     pub metric: String,
+    /// Inclusive lower bound, if any.
     pub min: Option<f64>,
+    /// Inclusive upper bound, if any.
     pub max: Option<f64>,
+    /// Positive normalization scale used when reporting violation magnitude.
     pub scale: f64,
 }
 /// Same nonempty factor name shares one uniform latent; unnamed inputs are independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Perturbation {
+    /// A registered path from [parameter_registry] to perturb before each sample.
     pub path: String,
+    /// Bounded-uniform perturbation half-width, in the path's own units; the sampled
+    /// offset lies in `[-half_range, half_range]`.
     pub half_range: f64,
+    /// When set, this perturbation shares one random draw per sample with every other
+    /// perturbation using the same factor name.
     pub factor: Option<String>,
 }
+/// A complete optimization problem: design variables, objectives/constraints, the
+/// motion/ride cases to evaluate them against, uncertainty sampling, and a search
+/// budget. Passed to [optimize] or [OptimizationSession::start].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizationRequest {
+    /// Design variables; see [Variable].
     pub variables: Vec<Variable>,
+    /// Linked coordinates evaluated after variable assignment and uncertainty; see [Relation].
     pub relations: Vec<Relation>,
+    /// Objectives to minimize; see [Target].
     pub targets: Vec<Target>,
+    /// Hard feasibility limits; see [Constraint].
     pub constraints: Vec<Constraint>,
+    /// Prescribed-motion cases every candidate is evaluated against.
     pub scenarios: Vec<Motion>,
+    /// An optional ride dynamics case evaluated alongside `scenarios`.
     pub ride_request: Option<RideRequest>,
+    /// Bounded random perturbations applied to the static design before each sample; see [Perturbation].
     pub uncertainty: Vec<Perturbation>,
+    /// Common-random-number uncertainty samples used while searching (0 disables uncertainty during search).
     pub training_samples: usize,
+    /// Independent held-out uncertainty samples used for final validation.
     pub validation_samples: usize,
+    /// Deterministic random seed for sampling and search.
     pub seed: u64,
+    /// Differential-evolution population size (4..=256).
     pub population_size: usize,
+    /// Target generation count (search may stop earlier on budget exhaustion).
     pub generations: usize,
+    /// Hard cap on total candidate evaluations, including final validation.
     pub max_evaluations: usize,
+    /// Cooperative active-compute time budget, seconds; checked between physics cases,
+    /// so an in-flight case can finish after the deadline.
     pub max_seconds: f64,
+    /// Parallel worker count for the native backend (1..=8).
     pub workers: usize,
 }
 impl Default for OptimizationRequest {
@@ -100,46 +166,80 @@ impl Default for OptimizationRequest {
         }
     }
 }
+/// One failed physics case recorded in an [Evaluation]'s `failures` (subject to
+/// `failures_truncated`; `failed_case_bits` is the exact, untruncated record).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
+    /// Which uncertainty sample this failure occurred in (0-based).
     pub sample: usize,
+    /// Which case within the sample failed, e.g. a scenario index or "ride".
     pub case: String,
+    /// Human-readable failure reason.
     pub reason: String,
 }
+/// The scored result of evaluating one candidate design against a full
+/// [OptimizationRequest]: every scenario, for every uncertainty sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
+    /// Every requested case across every sample finished (whether it succeeded or failed).
     pub complete: bool,
+    /// No constraint violation and no failed physics case.
     pub feasible: bool,
+    /// Weighted-aggregated target objective; `None` if incomplete or infeasible.
     pub score: Option<f64>,
+    /// Per-target normalized-error contribution to `score`, in target order.
     pub contributions: Vec<f64>,
     /// Target-major values at nominal uncertainty, in scenario order (one for scalar domains).
     pub nominal_target_values: Vec<Vec<f64>>,
+    /// Number of uncertainty samples evaluated (including the nominal case).
     pub sample_count: usize,
+    /// Number of samples with at least one failed physics case.
     pub failed_samples: usize,
+    /// Requested cases never reached because of a budget or cancellation.
     pub not_evaluated_cases: usize,
+    /// Total constraint-violation magnitude, summed over samples/constraints, in
+    /// normalized scale units; 0 when feasible.
     pub violation: f64,
+    /// Total physics cases this evaluation was supposed to run.
     pub requested_cases: usize,
+    /// Cases actually attempted (succeeded or failed), before any not-evaluated tail.
     pub completed_cases: usize,
+    /// Physics cases that solved successfully.
     pub physics_cases_completed: usize,
+    /// Physics cases that failed to solve.
     pub physics_cases_failed: usize,
+    /// Total failed cases across all samples (mirrors `failed_case_bits`'s set-bit count).
     pub failed_cases: usize,
+    /// Human-readable detail for failed cases, possibly truncated; see `failures_truncated`.
     pub failures: Vec<Failure>,
+    /// Whether `failures` omits some failures for size; `failed_case_bits`/`case_status`
+    /// still records every one exactly.
     pub failures_truncated: bool,
     /// Compact exact failure mask, including failures whose textual detail was truncated.
     pub failed_case_bits: Vec<u64>,
+    /// The largest single squared normalized target residual observed, for diagnosing
+    /// which case drives a `WorstSquared` target.
     pub worst_squared_residual: f64,
+    /// Which uncertainty sample produced `worst_squared_residual`.
     pub worst_sample: usize,
+    /// Ride dynamics model fidelity used, if `ride_request` was set; see [crate::dynamics::MODEL_FIDELITY].
     pub model_fidelity: Option<String>,
 }
+/// The outcome of one physics case within an [Evaluation], from [Evaluation::case_status].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseStatus {
+    /// The case solved successfully.
     Success,
+    /// The case failed to solve (invalid/unreachable geometry, contact loss, etc.).
     Failure,
+    /// The case was never reached (budget exhausted or cancelled first).
     NotEvaluated,
 }
 impl Evaluation {
-    /// case=0 is construction/property checks, 1..=S are Motions, S+1 is an optional ride.
+    /// Status of one physics case (see [CaseStatus]): case=0 is construction/property
+    /// checks, 1..=S are `scenarios` in order, S+1 is the optional ride case. Returns
+    /// `None` for an out-of-range `sample`/`case`.
     pub fn case_status(&self, sample: usize, case: usize) -> Option<CaseStatus> {
         let per = self.requested_cases.checked_div(self.sample_count)?;
         if sample >= self.sample_count || case >= per {
@@ -154,6 +254,9 @@ impl Evaluation {
             CaseStatus::Success
         })
     }
+    /// Feasibility-first ordering: complete beats incomplete, feasible beats infeasible,
+    /// lower score wins among feasible pairs, and fewer failed cases (then lower
+    /// violation) wins among infeasible pairs.
     pub fn better_than(&self, b: &Self) -> bool {
         if self.complete != b.complete {
             return self.complete;
@@ -167,28 +270,51 @@ impl Evaluation {
         (self.failed_cases, self.violation) < (b.failed_cases, b.violation)
     }
 }
+/// One design point: its variable values, the project built from them (if valid), and
+/// its scored [Evaluation].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
+    /// Variable values, in [OptimizationRequest::variables] order.
     pub values: Vec<f64>,
     /// Absent when construction or project validation failed.
     pub project: Option<Project>,
+    /// This candidate's scored evaluation.
     pub evaluation: Evaluation,
 }
+/// The complete result of [optimize] or [OptimizationSession::result]: search outcome,
+/// the notable candidates found, and independent validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationResult {
+    /// Search/validation outcome, e.g. `"validated"`, `"validation_failed"`,
+    /// `"budget_not_validated"`, or `"cancelled"`. Never treat a generic "completed"
+    /// worker status as implying this is `"validated"`.
     pub status: String,
+    /// The original input project, evaluated as a candidate for comparison.
     pub baseline: Option<Candidate>,
+    /// The best feasible candidate found, after fresh training recomputation.
     pub best_feasible: Option<Candidate>,
+    /// The best infeasible candidate found, if no feasible candidate was found.
     pub best_infeasible: Option<Candidate>,
+    /// `best_feasible` re-evaluated against independent held-out uncertainty samples.
     pub validation: Option<Evaluation>,
+    /// `best_feasible` re-evaluated once more against a fresh sample of the training
+    /// distribution, guarding against a search that merely overfit its training samples.
     pub training_revalidation: Option<Evaluation>,
+    /// Total candidate evaluations across baseline, search, and validation.
     pub candidate_attempts: usize,
+    /// Candidate evaluations spent on the baseline.
     pub baseline_attempts: usize,
+    /// Candidate evaluations spent on the population search.
     pub search_attempts: usize,
+    /// Candidate evaluations spent on final training-recompute and held-out validation.
     pub validation_attempts: usize,
+    /// Total individual physics cases that solved successfully, across all attempts.
     pub physics_cases_completed: usize,
+    /// Total individual physics cases that failed to solve, across all attempts.
     pub physics_cases_failed: usize,
+    /// Generations completed before the search stopped.
     pub generation: usize,
+    /// Cooperative active-compute time actually spent, seconds (paused time excluded).
     pub elapsed_seconds: f64,
 }
 /// Explicit numeric-leaf whitelist; optional numeric leaves must already exist.
@@ -266,6 +392,10 @@ pub fn parameter_registry(p: &Project) -> Vec<String> {
     }
     out
 }
+/// Names of every metric a [Target]/[Constraint] may reference: every field of
+/// [crate::Metrics] (geometry, read per-corner), plus ride-summary, analysis-gradient,
+/// and vehicle-level names (read axle-wide or vehicle-wide; see [crate::Corner] for
+/// what `corner: None` means for those).
 pub fn metric_registry() -> Vec<String> {
     let mut m: Vec<String> = serde_json::to_value(crate::Metrics::default())
         .unwrap()
@@ -557,6 +687,9 @@ fn samples(r: &OptimizationRequest, validation: bool) -> Vec<Vec<f64>> {
     }
     out
 }
+/// Summarize a complete (untruncated) [RideRun] of exactly `duration` seconds into the
+/// scalar `ride.*` metrics from [metric_registry]. Errs if the run terminated early,
+/// doesn't span `duration`, or produced a nonfinite sample.
 pub fn ride_summary(
     run: &RideRun,
     duration: f64,
@@ -630,6 +763,9 @@ pub fn ride_summary(
 fn stopped(token: Option<&AtomicBool>, start: Instant, seconds: f64) -> bool {
     token.is_some_and(|t| t.load(Ordering::Relaxed)) || start.elapsed().as_secs_f64() >= seconds
 }
+/// Evaluate one candidate's variable values `x` (in [OptimizationRequest::variables]
+/// order) against `r`'s full scenario/ride/uncertainty set, without cancellation or a
+/// stop callback. See [evaluate_candidate_controlled] to pass those.
 pub fn evaluate_candidate(
     p: &Project,
     r: &OptimizationRequest,
@@ -1077,6 +1213,8 @@ fn base_values(p: &Project, r: &OptimizationRequest) -> Vec<f64> {
         .collect()
 }
 impl OptimizationSession {
+    /// Begin a new session for `r` against `p`. Validates `r` (bounds, registry
+    /// membership, size limits) before returning.
     pub fn start(p: &Project, r: &OptimizationRequest) -> Result<Self, Error> {
         validate(p, r)?;
         Ok(Self {
@@ -1109,16 +1247,25 @@ impl OptimizationSession {
             },
         })
     }
+    /// The current (possibly partial) [OptimizationResult]; call after [Self::advance]
+    /// to see progress, or once [Self::is_finished] to get the final result.
     pub fn result(&self) -> OptimizationResult {
         self.state.result.clone()
     }
+    /// Whether the session has reached a terminal phase (validated, failed, or cancelled).
     pub fn is_finished(&self) -> bool {
         self.state.phase == "done"
     }
+    /// Serialize this session's full internal state, including precomputed generation
+    /// trials and completed results, for later [Self::resume]. Checksummed against
+    /// corruption; pauses between `checkpoint`/`resume` consume no active-time budget.
     pub fn checkpoint(&self) -> Result<String, Error> {
         let payload = serde_json::to_string(&self.state).map_err(|e| err(e.to_string()))?;
         serde_json::to_string(&(checksum(&payload), payload)).map_err(|e| err(e.to_string()))
     }
+    /// Resume a session from a [Self::checkpoint] string. `p` and `r` must exactly match
+    /// the project/request the checkpoint was created with; the checkpoint's own
+    /// consistency (checksum, phase, recorded identity) is re-validated on resume.
     pub fn resume(p: &Project, r: &OptimizationRequest, json: &str) -> Result<Self, Error> {
         validate(p, r)?;
         if json.len() > 256_000_000 {
@@ -1570,6 +1717,10 @@ impl OptimizationSession {
         Ok(self.result())
     }
 }
+/// Run a complete native optimization to completion: baseline, budgeted population
+/// search, best-candidate recomputation, and independent held-out validation. A
+/// blocking convenience over [OptimizationSession]; use the session directly for
+/// interactive progress, cancellation, or checkpointing.
 pub fn optimize(p: &Project, r: &OptimizationRequest) -> Result<OptimizationResult, Error> {
     let mut s = OptimizationSession::start(p, r)?;
     while !s.is_finished() {

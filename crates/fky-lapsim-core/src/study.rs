@@ -1,24 +1,45 @@
+//! Prescribed vehicle-level motion: commands chassis heave/roll/pitch/rack and solves
+//! all four corners together, on a flat or per-corner road.
 use crate::{CornerState, Error, Project};
 use serde::{Deserialize, Serialize};
+/// Commanded chassis/rack motion for [simulate]/[simulate_on_road]/[sweep]. The finite
+/// chassis rotation is `Ry(pitch) * Rx(roll)` about the chassis center of mass, so
+/// roll and pitch are not interchangeable Euler components.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Motion {
+    /// Chassis heave, metres; positive lifts the chassis.
     pub heave: f64,
+    /// Chassis roll, radians; a right-handed rotation about +x.
     pub roll: f64,
+    /// Chassis pitch, radians; a right-handed rotation about +y, so positive pitch
+    /// lowers the nose.
     pub pitch: f64,
+    /// Front-axle rack travel, metres, along each front corner's `rack_axis`.
     pub rack_front: f64,
+    /// Rear-axle rack travel, metres, along each rear corner's `rack_axis`.
     pub rack_rear: f64,
 }
+/// A solved vehicle pose: the commanded [Motion] and all four corners' solved state,
+/// in the world frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleState {
+    /// The motion this state was solved for.
     pub motion: Motion,
+    /// Solved state for all four corners, world frame.
     pub corners: [CornerState; 4],
 }
+/// One requested [Motion] from a [sweep], with its solved state or failure reason.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
+    /// The requested motion.
     pub motion: Motion,
+    /// Solved state, or `None` if this motion failed to solve.
     pub state: Option<VehicleState>,
+    /// Failure message, or `None` if `state` is present.
     pub error: Option<String>,
 }
+/// Solve all four corners for `m` on a flat (zero-height) road. Equivalent to
+/// `simulate_on_road(p, m, [0.0; 4])`.
 pub fn simulate(p: &Project, m: &Motion) -> Result<VehicleState, Error> {
     simulate_on_road(p, m, [0.0; 4])
 }
@@ -108,6 +129,9 @@ pub(crate) fn simulate_on_road_tolerance(
             .map_err(|_| err("expected four corners"))?,
     })
 }
+/// Solve `simulate` for every requested motion, retaining each result (or error)
+/// rather than filtering failures out. Inspect `Sample::error` before assessing a
+/// study's feasibility.
 pub fn sweep(p: &Project, m: &[Motion]) -> Vec<Sample> {
     m.iter()
         .map(|m| match simulate(p, m) {

@@ -8,50 +8,78 @@ use crate::{Chassis, SpringDamper};
 use crate::{CornerId, Error, Project};
 use serde::{Deserialize, Serialize};
 
+/// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::Reduced].
 pub const MODEL_FIDELITY: &str = "nonlinear_sprung_body_fixed_contact_massless_links";
+/// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::RetainedComponentInertia].
 pub const COMPONENT_MODEL_FIDELITY: &str =
     "nonlinear_rigid_arm_rocker_nonspinning_knuckle_inertia_prescribed_fixed_contact";
+/// Ride dynamics fidelity: whether each corner's link/knuckle mass is retained.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RideMode {
+    /// Massless wishbones/rocker/knuckle; only the chassis sprung mass, springs, and
+    /// dampers carry inertia and weight.
     #[default]
     Reduced,
+    /// Include each corner's configured upper/lower arm, rocker, and nonspinning
+    /// knuckle/wheel inertia (see [crate::ComponentMasses]). Requires a road input
+    /// with continuous velocity; rejects [RoadInput::Histories].
     RetainedComponentInertia,
 }
+/// Prescribed road height at each corner's wheel, as a function of time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoadInput {
+    /// Horizontal road at z = 0 for the whole run.
     #[default]
     Flat,
     /// Temporal sinusoid in Hz; phases in radians, ordered like Project.corners.
     Sine {
+        /// Road height amplitude, metres.
         amplitude_m: f64,
+        /// Oscillation frequency, Hz (must be finite and >= 0).
         frequency_hz: f64,
+        /// Per-corner phase offset, radians, ordered like `Project.corners`.
         phases_rad: [f64; 4],
     },
     /// Spatial sinusoid sampled at design wheel x plus speed*time.
     SpatialSine {
+        /// Road height amplitude, metres.
         amplitude_m: f64,
+        /// Spatial wavelength, metres (must be finite and > 0).
         wavelength_m: f64,
+        /// Forward travel speed used to convert wheel x-position into a moving phase, m/s.
         speed_m_s: f64,
+        /// Per-corner phase offset, radians, ordered like `Project.corners`.
         phases_rad: [f64; 4],
     },
     /// Continuous piecewise linear heights; times must span the complete run.
     /// Samples are [time seconds, height metres]. Velocity is right-continuous at
     /// interior knots; integration ends the preceding interval with its left velocity.
-    Histories { corners: [Vec<[f64; 2]>; 4] },
+    Histories {
+        /// Per-corner `[time_s, height_m]` samples, ordered like `Project.corners`;
+        /// each series must be sorted, span `[0, duration_s]`, and have at least two points.
+        corners: [Vec<[f64; 2]>; 4],
+    },
 }
+/// A ride dynamics run: fidelity mode, fixed rack travel, initial state/road, and
+/// integration settings. Passed to [ride].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RideRequest {
+    /// Dynamics fidelity; see [RideMode].
     pub mode: RideMode,
     /// Fixed rack travel in metres for the complete ride.
     pub rack_front: f64,
+    /// Fixed rear rack travel in metres for the complete ride.
     pub rack_rear: f64,
     /// Coarse central difference step, metres for translations/radians for angles.
     /// Mass mode verifies half-step acceleration and support reaction convergence.
     pub derivative_step: f64,
+    /// Total simulated duration, seconds.
     pub duration_s: f64,
+    /// Fixed integration timestep, seconds; a failed stage halves it down to
+    /// `min(dt_s, 1e-5 s)` before the run terminates.
     pub dt_s: f64,
     /// Offsets from equilibrium when solve_equilibrium is true, otherwise absolute.
     pub initial_displacement: [f64; 3],
@@ -61,6 +89,7 @@ pub struct RideRequest {
     pub external_force: [f64; 3],
     /// Solve with the road frozen at t=0 before applying initial offsets.
     pub solve_equilibrium: bool,
+    /// Prescribed road input for the run; see [RoadInput].
     pub road: RoadInput,
 }
 impl Default for RideRequest {
@@ -80,38 +109,59 @@ impl Default for RideRequest {
         }
     }
 }
+/// One accepted integration sample of a [RideRun].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideSample {
+    /// Simulation time, seconds, since the start of the run.
     pub time_s: f64,
+    /// Generalized chassis state `[heave m, roll rad, pitch rad]`.
     pub displacement: [f64; 3],
+    /// Generalized chassis rate `[heave m/s, roll rad/s, pitch rad/s]`.
     pub velocity: [f64; 3],
+    /// Generalized chassis acceleration `[heave m/s^2, roll rad/s^2, pitch rad/s^2]`.
     pub acceleration: [f64; 3],
+    /// Per-corner shock compression relative to design length, metres.
     pub compression_m: [f64; 4],
+    /// Per-corner shock compression rate, m/s; positive in compression.
     pub compression_velocity_m_s: [f64; 4],
+    /// Per-corner combined spring+damper force, newtons; see [spring_force]/[damper_force].
     pub shock_force_n: [f64; 4],
     /// Vertical prescribed-support reactions, including retained component inertia in mass mode.
     pub support_reaction_n: [f64; 4],
+    /// Total mechanical energy (kinetic + gravitational + spring potential) at this sample, joules.
     pub energy_j: f64,
     /// Positive integral of signed damper force times compression velocity.
     pub dissipated_work_j: f64,
     /// Integral of the selected model's support reactions times prescribed road velocity.
     pub support_work_j: f64,
+    /// Integral of the requested generalized external force/moment along the chassis rate.
     pub external_work_j: f64,
+    /// `energy_j` minus the initial energy plus dissipated/support/external work; an
+    /// energy-conservation residual used as a correctness check, not a physical quantity.
     pub energy_balance_error_j: f64,
 }
+/// Why a [RideRun] stopped before its requested `duration_s`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideTermination {
     /// Time of the failed integration-stage or accepted-state evaluation.
     pub time_s: f64,
+    /// Time of the last successfully accepted sample, if any.
     pub last_valid_time_s: Option<f64>,
+    /// The corner whose geometry or contact condition triggered termination, if identifiable.
     pub corner: Option<CornerId>,
+    /// Human-readable termination reason.
     pub reason: String,
 }
+/// The result of [ride]: fidelity used, retained samples, and any termination event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideRun {
+    /// [MODEL_FIDELITY] or [COMPONENT_MODEL_FIDELITY], matching the request's [RideMode].
     pub model_fidelity: String,
+    /// Corner identifiers, in the same order as `compression_m`/`shock_force_n`/etc.
     pub corner_ids: [CornerId; 4],
+    /// Solved static-equilibrium `[heave, roll, pitch]`, if `solve_equilibrium` was requested.
     pub equilibrium: Option<[f64; 3]>,
+    /// Every accepted sample, including the initial state, in time order.
     pub samples: Vec<RideSample>,
     /// None means the requested duration was completed.
     pub termination: Option<RideTermination>,

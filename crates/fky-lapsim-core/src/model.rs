@@ -1,30 +1,49 @@
+//! The [Project] schema: static hardpoints, tire envelope, spring/damper law, and optional
+//! retained component masses for each of the four corners. See `docs/model-conventions.md`
+//! for the sign/unit conventions these fields follow.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Coordinates in metres: x forward, y left, z up.
 pub type Point = [f64; 3];
 
+/// A corner's identity. Its position in a serialized `[Corner; 4]` array does not
+/// determine this identity; match on `id` instead of array index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CornerId {
+    /// Front axle, +y (left) side.
     FrontLeft,
+    /// Front axle, -y (right) side.
     FrontRight,
+    /// Rear axle, +y (left) side.
     RearLeft,
+    /// Rear axle, -y (right) side.
     RearRight,
 }
 
+/// Which body a corner's pushrod pickup point is rigidly fixed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PushrodBody {
+    /// The pickup follows the upper wishbone.
     UpperArm,
+    /// The pickup follows the lower wishbone.
     LowerArm,
+    /// The pickup follows the knuckle.
     Knuckle,
 }
 
+/// A corner's spring and damper force law. Positive compression and compression
+/// velocity share the same direction; see `docs/model-conventions.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpringDamper {
+    /// Optional minimum shock length in metres; a ride run stops if the solved
+    /// length would drop below it. `None` means no lower travel limit is enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_length_m: Option<f64>,
+    /// Optional maximum shock length in metres; a ride run stops if the solved
+    /// length would exceed it. `None` means no upper travel limit is enforced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_length_m: Option<f64>,
     /// Linear spring rate in N/m.
@@ -33,6 +52,7 @@ pub struct SpringDamper {
     pub preload: f64,
     /// Viscous damping in N s/m.
     pub compression_damping: f64,
+    /// Viscous damping in N s/m, applied in rebound (negative compression velocity).
     pub rebound_damping: f64,
     /// Optional [compression m, total spring force N] curve replaces rate/preload.
     /// Piecewise linear, with constant force beyond endpoints; bilateral forces allowed.
@@ -42,6 +62,7 @@ pub struct SpringDamper {
     /// Start at `[0,0]`, interpolate linearly, hold the last magnitude above the table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_curve: Option<Vec<[f64; 2]>>,
+    /// Passive rebound-force table; same shape rule as `compression_curve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebound_curve: Option<Vec<[f64; 2]>>,
 }
@@ -61,9 +82,13 @@ impl Default for SpringDamper {
     }
 }
 
+/// Sprung-body mass properties used by ride dynamics. Excludes any masses retained
+/// separately in each corner's `component_masses`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Chassis {
+    /// Sprung mass in kilograms; must be finite and positive.
     pub sprung_mass: f64,
+    /// Center of mass in the design-chassis frame, metres.
     pub center_of_mass: Point,
     /// Principal inertia about the center of mass in kg m², aligned to chassis axes.
     pub inertia: Point,
@@ -78,12 +103,19 @@ impl Default for Chassis {
     }
 }
 
+/// Rigid tire contact envelope shape used for road/ground closure. These are rigid
+/// analytic envelopes, not tread or deformable tire models; see [Corner::tire_radius]
+/// and [Corner::tire_width].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TireProfile {
+    /// Zero-width disk (the backward-compatible default).
     #[default]
     Disk,
+    /// Rigid cylinder spanning the full `tire_width`.
     Cylinder,
+    /// Rigid torus of outer radius `tire_radius` and tube diameter `tire_width`;
+    /// requires `tire_width / 2 < tire_radius`.
     Torus,
 }
 fn default_rack_axis() -> [Point; 2] {
@@ -95,64 +127,108 @@ fn default_rack_axis() -> [Point; 2] {
 /// from chassis sprung_mass. Knuckle includes the wheel without wheel spin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyMass {
+    /// Mass in kilograms; must be finite and nonnegative.
     pub mass_kg: f64,
+    /// Center of mass in the static hardpoint (design-chassis) frame, metres.
     pub center_of_mass: Point,
+    /// Symmetric 3-by-3 inertia tensor about the center of mass, design-chassis
+    /// axes, kg m². Must be positive definite and satisfy the triangle inequality
+    /// when `mass_kg > 0`.
     pub inertia: [[f64; 3]; 3],
 }
+/// Optional retained mass/inertia for a corner's rigid links. A `None` body is
+/// treated as massless; see [RideMode::RetainedComponentInertia](crate::RideMode::RetainedComponentInertia).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ComponentMasses {
+    /// Upper wishbone mass properties.
     pub upper_arm: Option<BodyMass>,
+    /// Lower wishbone mass properties.
     pub lower_arm: Option<BodyMass>,
+    /// Knuckle mass properties, including the nonspinning wheel assembly.
     pub knuckle: Option<BodyMass>,
+    /// Rocker mass properties.
     pub rocker: Option<BodyMass>,
 }
 
+/// One corner's complete static geometry, tire, steering/pushrod linkage, and
+/// spring/damper configuration. All points are in the design-chassis frame, metres.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Corner {
+    /// Optional retained mass/inertia for this corner's links.
     #[serde(default)]
     pub component_masses: ComponentMasses,
+    /// This corner's identity; independent of its position in [Project::corners].
     pub id: CornerId,
+    /// Upper wishbone's forward inner pivot.
     pub upper_front: Point,
+    /// Upper wishbone's rearward inner pivot.
     pub upper_rear: Point,
+    /// Lower wishbone's forward inner pivot.
     pub lower_front: Point,
+    /// Lower wishbone's rearward inner pivot.
     pub lower_rear: Point,
+    /// Upper wishbone's outer ball joint (kingpin top).
     pub upper_ball: Point,
+    /// Lower wishbone's outer ball joint (kingpin bottom).
     pub lower_ball: Point,
+    /// Tie-rod's inner, rack-side pickup at the design pose.
     pub steering_inner: Point,
+    /// Tie-rod's outer, knuckle-side pickup.
     pub steering_outer: Point,
+    /// Wheel center at the design pose.
     pub wheel_center: Point,
     /// Two distinct points define the spindle axis (direction has no sign convention).
     pub spindle_axis: [Point; 2],
+    /// Outer tire radius R in metres; must be finite and positive.
     pub tire_radius: f64,
+    /// Rigid tire contact envelope shape.
     #[serde(default)]
     pub tire_profile: TireProfile,
+    /// Chassis-fixed directed point pair; rack travel moves `steering_inner` along
+    /// the normalized direction from the first point to the second. Defaults to
+    /// `[[0,0,0],[0,1,0]]`.
     #[serde(default = "default_rack_axis")]
     pub rack_axis: [Point; 2],
     /// Full width for cylinder/torus envelopes.
     pub tire_width: f64,
+    /// Which body the pushrod pickup is rigidly fixed to.
     pub pushrod_body: PushrodBody,
+    /// Pushrod's attachment point on its owning body (`pushrod_body`), at the
+    /// design pose.
     pub pushrod_pickup: Point,
+    /// Two points on the rocker's chassis-fixed rotation axis.
     pub rocker_axis: [Point; 2],
+    /// Rocker's pushrod attachment point at the design pose.
     pub rocker_pushrod: Point,
+    /// Rocker's shock attachment point at the design pose.
     pub rocker_shock: Point,
+    /// Shock's chassis-side attachment point.
     pub shock_chassis: Point,
+    /// Spring and damper force law for this corner's shock.
     #[serde(default)]
     pub spring_damper: SpringDamper,
 }
 
+/// A complete suspension model: schema version, name, chassis, and all four corners.
+/// Construct and mutate freely; call [Project::validate] before solving.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
+    /// Schema version; [Project::validate] currently requires exactly `1`.
     pub schema_version: u32,
+    /// Free-form project name.
     pub name: String,
+    /// Sprung-body mass properties.
     #[serde(default)]
     pub chassis: Chassis,
     /// Exactly one of each CornerId; array order does not identify a corner.
     pub corners: [Corner; 4],
 }
 
+/// A model validation or numerical solve failure, carrying a human-readable message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
+    /// Description of what failed.
     pub message: String,
 }
 impl fmt::Display for Error {
@@ -163,6 +239,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Project {
+    /// Checks schema version; finite, positive, triangle-inequality-satisfying chassis
+    /// inertia; a finite chassis center of mass; that all four corner IDs are present
+    /// and distinct; and each corner's own [Corner::validate]. Kinematics, analysis,
+    /// ride, and optimization entry points call this internally.
     pub fn validate(&self) -> Result<(), Error> {
         require(self.schema_version == 1, "unsupported schema version")?;
         require(
@@ -277,6 +357,11 @@ fn triangle(a: Point, b: Point, c: Point) -> bool {
 }
 
 impl Corner {
+    /// Checks finite/positive/symmetric component masses and inertias (when present);
+    /// consistent shock length limits; finite hardpoints; distinct axis endpoints;
+    /// nondegenerate wishbone/rocker triangles; positive tire/spring parameters; the
+    /// torus width/radius constraint; and any spring/damper force table's shape.
+    /// Called by [Project::validate] for every corner.
     pub fn validate(&self) -> Result<(), Error> {
         let c = self;
         for (name, body) in [
