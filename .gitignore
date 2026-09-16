@@ -1,4 +1,5 @@
 /target/
+/benchmarks/native/target/
 __pycache__/
 *.pyc
 .venv/
