@@ -606,3 +606,67 @@ fn overflow_is_a_retained_failure_not_nonfinite_json() {
         .unwrap()
         .contains("null"));
 }
+fn edited_checkpoint(json: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let (_, payload): (u64, String) = serde_json::from_str(json).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    edit(&mut state);
+    let payload = serde_json::to_string(&state).unwrap();
+    let sum = payload.bytes().fold(0xcbf29ce484222325u64, |a, b| {
+        (a ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    serde_json::to_string(&(sum, payload)).unwrap()
+}
+#[test]
+fn checkpoint_rejects_fabricated_terminal_success() {
+    let p = Project::example();
+    let r = request();
+    let s = OptimizationSession::start(&p, &r).unwrap();
+    let forged = edited_checkpoint(&s.checkpoint().unwrap(), |v| {
+        v["phase"] = serde_json::json!("done");
+        v["result"]["status"] = serde_json::json!("validated");
+    });
+    assert!(OptimizationSession::resume(&p, &r, &forged).is_err());
+}
+#[test]
+fn checkpoint_checks_baseline_and_both_validation_reports() {
+    let p = Project::example();
+    let mut r = request();
+    r.max_evaluations = 3;
+    let mut s = OptimizationSession::start(&p, &r).unwrap();
+    while !s.is_finished() {
+        s.advance(3, None).unwrap();
+    }
+    let json = s.checkpoint().unwrap();
+    assert!(OptimizationSession::resume(&p, &r, &json)
+        .unwrap()
+        .is_finished());
+    for path in [
+        "/result/baseline/evaluation/completed_cases",
+        "/result/training_revalidation/completed_cases",
+        "/result/validation/completed_cases",
+    ] {
+        let forged = edited_checkpoint(&json, |v| {
+            *v.pointer_mut(path).unwrap() = serde_json::json!(999999);
+        });
+        assert!(
+            OptimizationSession::resume(&p, &r, &forged).is_err(),
+            "accepted {path}"
+        );
+    }
+    for path in ["/result/validation", "/result/best_feasible"] {
+        let forged = edited_checkpoint(&json, |v| {
+            *v.pointer_mut(path).unwrap() = serde_json::Value::Null;
+        });
+        assert!(
+            OptimizationSession::resume(&p, &r, &forged).is_err(),
+            "accepted missing {path}"
+        );
+    }
+}
+#[test]
+fn ride_summary_rejects_nonfinite_duration() {
+    let run = synthetic_ride();
+    for duration in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        assert!(ride_summary(&run, duration).is_err(), "accepted {duration}");
+    }
+}

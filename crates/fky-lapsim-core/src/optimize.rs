@@ -562,6 +562,7 @@ pub fn ride_summary(
     duration: f64,
 ) -> Result<std::collections::BTreeMap<String, f64>, Error> {
     if run.termination.is_some()
+        || !duration.is_finite()
         || duration <= 0.
         || run.samples.len() < 2
         || run.samples.first().unwrap().time_s != 0.
@@ -941,6 +942,80 @@ struct SessionState {
     phase: String,
     result: OptimizationResult,
 }
+fn check_persisted_evaluation(
+    e: &Evaluation,
+    r: &OptimizationRequest,
+    held_out: bool,
+) -> Result<(), Error> {
+    let samples = 1 + if held_out {
+        r.validation_samples
+    } else {
+        r.training_samples
+    };
+    let per = 1 + r.scenarios.len() + usize::from(r.ride_request.is_some());
+    let expected = samples * per;
+    if e.sample_count != samples
+        || e.requested_cases != expected
+        || e.completed_cases > expected
+        || e.complete != (e.completed_cases == expected)
+        || e.not_evaluated_cases != expected - e.completed_cases
+        || e.failed_cases > e.completed_cases
+        || e.failed_samples > samples
+        || e.failed_samples > e.failed_cases
+        || e.physics_cases_completed > e.completed_cases
+        || e.physics_cases_completed > e.completed_cases - e.completed_cases.div_ceil(per)
+        || e.physics_cases_failed > e.physics_cases_completed
+        || !e.violation.is_finite()
+        || e.violation < 0.
+        || !e.worst_squared_residual.is_finite()
+        || e.worst_squared_residual < 0.
+        || e.worst_sample >= samples
+        || e.contributions.len() != r.targets.len()
+        || e.contributions.iter().any(|v| !v.is_finite() || *v < 0.)
+        || e.nominal_target_values.len() != r.targets.len()
+        || e.nominal_target_values
+            .iter()
+            .zip(&r.targets)
+            .any(|(v, t)| {
+                v.iter().any(|n| !n.is_finite())
+                    || v.len()
+                        > if t.metric.starts_with("project:") || t.metric.starts_with("ride.") {
+                            1
+                        } else {
+                            r.scenarios.len()
+                        }
+            })
+        || e.failed_case_bits.len() != expected.div_ceil(64)
+        || e.failures.len() > 32
+        || e.failures.len() > e.failed_cases
+        || e.score
+            .is_some_and(|v| !v.is_finite() || v < 0. || v != e.contributions.iter().sum::<f64>())
+        || e.score.is_some() != (e.complete && e.failed_cases == 0)
+        || e.feasible
+            != (e.complete && e.failed_cases == 0 && e.violation == 0. && e.score.is_some())
+    {
+        return Err(err("invalid persisted evaluation"));
+    }
+    for f in &e.failures {
+        let ci = f
+            .case
+            .parse::<usize>()
+            .map_err(|_| err("invalid persisted failure case"))?;
+        if f.sample >= samples
+            || ci >= per
+            || f.sample * per + ci >= e.completed_cases
+            || e.case_status(f.sample, ci) != Some(CaseStatus::Failure)
+        {
+            return Err(err("invalid persisted failure coordinates"));
+        }
+    }
+    if (e.completed_cases..e.failed_case_bits.len() * 64)
+        .any(|i| e.failed_case_bits[i / 64] & (1u64 << (i % 64)) != 0)
+    {
+        return Err(err("failure mask marks unprocessed cases"));
+    }
+    Ok(())
+}
 /// Checkpoint includes precomputed generation trials and completed results; pauses consume no time.
 pub struct OptimizationSession {
     state: SessionState,
@@ -1072,6 +1147,102 @@ impl OptimizationSession {
         {
             return Err(err("inconsistent checkpoint phase or accounting"));
         }
+        let result = &s.result;
+        let physics_per_sample = r.scenarios.len() + usize::from(r.ride_request.is_some());
+        let max_physics = ((result.candidate_attempts) * (r.training_samples + 1)
+            + result.validation_attempts * (r.validation_samples + 1))
+            * physics_per_sample;
+        if result.baseline.is_some() != (result.baseline_attempts == 1)
+            || (matches!(s.phase.as_str(), "initial" | "evolution" | "validation")
+                && result.baseline_attempts != 1)
+            || result.search_attempts < s.population.len() + s.pending_results.len()
+            || result.physics_cases_completed > max_physics
+            || result.training_revalidation.is_some() != (result.validation_attempts == 1)
+            || result.validation.is_some() != (result.validation_attempts == 1)
+            || (result.search_attempts == 0
+                && (result.best_feasible.is_some() || result.best_infeasible.is_some()))
+            || result.best_feasible.as_ref().is_some_and(|c| {
+                !c.evaluation.feasible || !c.evaluation.complete || c.project.is_none()
+            })
+            || result
+                .best_infeasible
+                .as_ref()
+                .is_some_and(|c| c.evaluation.feasible || !c.evaluation.complete)
+            || (result.validation_attempts == 1
+                && (s.phase != "done"
+                    || result.search_attempts == 0
+                    || result.baseline_attempts != 1))
+            || result.physics_cases_failed > result.physics_cases_completed
+        {
+            return Err(err("inconsistent checkpoint reports"));
+        }
+        let mut persisted_physics = 0usize;
+        let mut persisted_failed = 0usize;
+        if let Some(b) = &result.baseline {
+            if b.project.as_ref() != Some(p) || !b.values.is_empty() {
+                return Err(err("invalid persisted baseline"));
+            }
+            check_persisted_evaluation(&b.evaluation, r, false)?;
+            persisted_physics += b.evaluation.physics_cases_completed;
+            persisted_failed += b.evaluation.physics_cases_failed;
+        }
+        if let Some(e) = &result.training_revalidation {
+            check_persisted_evaluation(e, r, false)?;
+            persisted_physics += e.physics_cases_completed;
+            persisted_failed += e.physics_cases_failed;
+            if e.complete {
+                let fresh = if e.feasible {
+                    result.best_feasible.as_ref()
+                } else {
+                    result.best_infeasible.as_ref()
+                };
+                if fresh.is_none_or(|c| {
+                    serde_json::to_value(&c.evaluation).unwrap() != serde_json::to_value(e).unwrap()
+                }) || (!e.feasible && result.best_feasible.is_some())
+                {
+                    return Err(err("winner does not match final recomputation"));
+                }
+            }
+        }
+        if let Some(e) = &result.validation {
+            check_persisted_evaluation(e, r, true)?;
+            persisted_physics += e.physics_cases_completed;
+            persisted_failed += e.physics_cases_failed;
+        }
+        if persisted_physics > result.physics_cases_completed
+            || persisted_failed > result.physics_cases_failed
+        {
+            return Err(err("checkpoint physics accounting omits persisted reports"));
+        }
+        if s.phase == "done" {
+            let pair = result
+                .training_revalidation
+                .as_ref()
+                .zip(result.validation.as_ref());
+            let valid = match result.status.as_str() {
+                "validated" => {
+                    pair.is_some_and(|(t, v)| t.complete && v.complete && t.feasible && v.feasible)
+                        && result.best_feasible.is_some()
+                }
+                "validation_failed" => pair
+                    .is_some_and(|(t, v)| t.complete && v.complete && (!t.feasible || !v.feasible)),
+                "budget_not_validated" => {
+                    (result.candidate_attempts >= r.max_evaluations
+                        || result.elapsed_seconds >= r.max_seconds)
+                        && pair.is_none_or(|(t, v)| !t.complete || !v.complete)
+                }
+                "cancelled_not_validated" => pair.is_none_or(|(t, v)| !t.complete || !v.complete),
+                "no_feasible_candidate" => {
+                    result.baseline_attempts == 1
+                        && result.best_feasible.is_none()
+                        && result.validation_attempts == 0
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(err("invalid terminal checkpoint status/evidence"));
+            }
+        }
         for c in s
             .population
             .iter()
@@ -1079,33 +1250,9 @@ impl OptimizationSession {
             .chain(s.result.best_feasible.iter())
             .chain(s.result.best_infeasible.iter())
         {
+            check_persisted_evaluation(&c.evaluation, r, false)?;
             let realized = construct(p, r, &c.values, &vec![0.; r.uncertainty.len()]).ok();
-            if realized != c.project
-                || c.values.len() != r.variables.len()
-                || c.evaluation.score.is_some_and(|v| !v.is_finite() || v < 0.)
-                || !c.evaluation.violation.is_finite()
-                || c.evaluation.violation < 0.
-                || c.evaluation.completed_cases > c.evaluation.requested_cases
-                || c.evaluation.contributions.len() != r.targets.len()
-                || c.evaluation
-                    .contributions
-                    .iter()
-                    .any(|v| !v.is_finite() || *v < 0.)
-                || c.evaluation.nominal_target_values.len() != r.targets.len()
-                || c.evaluation.not_evaluated_cases
-                    != c.evaluation.requested_cases - c.evaluation.completed_cases
-                || c.evaluation.physics_cases_completed > c.evaluation.completed_cases
-                || c.evaluation.physics_cases_failed > c.evaluation.physics_cases_completed
-                || c.evaluation.failed_case_bits.len() != c.evaluation.requested_cases.div_ceil(64)
-                || (c.evaluation.feasible
-                    && (!c.evaluation.complete
-                        || c.evaluation.failed_cases != 0
-                        || c.evaluation.violation != 0.
-                        || c.evaluation.score.is_none()))
-                || c.evaluation
-                    .score
-                    .is_some_and(|v| v != c.evaluation.contributions.iter().sum::<f64>())
-            {
+            if realized != c.project || c.values.len() != r.variables.len() {
                 return Err(err("invalid checkpoint score"));
             }
         }
