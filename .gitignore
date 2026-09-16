@@ -8,3 +8,8 @@ __pycache__/
 *.pdb
 .pytest_cache/
 /target/wheels/
+/python/dwsuspension/static/
+/dist/
+/build/
+/packaging/*.venv/
+/packaging/build/
