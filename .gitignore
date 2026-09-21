@@ -13,3 +13,4 @@ __pycache__/
 /build/
 /packaging/*.venv/
 /packaging/build/
+/.worktrees/
