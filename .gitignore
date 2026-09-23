@@ -14,3 +14,8 @@ __pycache__/
 /packaging/*.venv/
 /packaging/build/
 /.worktrees/
+
+# Reference source documents (large, copyrighted). Only their extracted text
+# in ref/text/ is tracked.
+ref/*.pdf
+ref/*.doc
