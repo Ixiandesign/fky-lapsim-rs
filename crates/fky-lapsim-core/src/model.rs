@@ -233,10 +233,19 @@ pub struct Corner {
 
 /// A pair of spring/damper elements coupling one axle's two corners: [AxleInterconnect::heave]
 /// reacts the symmetric (average) component of the two corners' interconnect-arm travel,
-/// [AxleInterconnect::roll] reacts the antisymmetric (difference) component. This is a
+/// [AxleInterconnect::roll] reacts the antisymmetric (half-difference) component. This is a
 /// lumped-spring idealization of a third-spring/T-bar/ARB-blade mechanism, not a modeled
 /// secondary rigid body; see `docs/research/suspension-research.md` section 6. Both fields
 /// are always configured together in this schema version.
+///
+/// `heave`/`roll` `spring_rate` and damping act on this averaged/half-difference travel, not
+/// on a physical two-ended spring's own compression. A real spring/damper wired directly
+/// between the two corners' arm tips compresses by the *sum* of their individual travels
+/// (both ends move under symmetric heave), i.e. twice this struct's `heave`/`roll` coordinate;
+/// its own rate therefore produces four times the wheel-rate a naively equal `spring_rate`
+/// here would (`k*(2m)^2` vs `k*m^2` at matched motion ratio `m`). Reproducing a physical
+/// interconnect spring/damper's manufacturer or measured rate here requires multiplying it
+/// by 4, not entering it directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AxleInterconnect {
     /// Spring/damper reacting symmetric (heave) interconnect-arm travel.
