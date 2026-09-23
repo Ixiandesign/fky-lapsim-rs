@@ -14,3 +14,8 @@ __pycache__/
 /packaging/*.venv/
 /packaging/build/
 /.worktrees/
+# Impeccable plugin's own local cache/scratch state, not project artifacts.
+.impeccable/hook.cache.json
+.impeccable/live/
+app/.impeccable/hook.cache.json
+app/.impeccable/live/
