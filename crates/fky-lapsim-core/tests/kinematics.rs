@@ -14,6 +14,94 @@ fn distance(a: Point, b: Point) -> f64 {
         .sum::<f64>()
         .sqrt()
 }
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm(a: [f64; 3]) -> f64 {
+    dot(a, a).sqrt()
+}
+/// Component of `p - axis0` perpendicular to the unit `axis_dir`.
+fn radial(p: Point, axis0: Point, axis_dir: [f64; 3]) -> [f64; 3] {
+    let r = sub(p, axis0);
+    let along = dot(r, axis_dir);
+    sub(r, [axis_dir[0] * along, axis_dir[1] * along, axis_dir[2] * along])
+}
+/// Signed rotation angle (radians) about `(axis0, axis_dir)` mapping `design` to `solved`,
+/// for a point rigidly rotating about that axis.
+fn swept_angle(design: Point, solved: Point, axis0: Point, axis_dir: [f64; 3]) -> f64 {
+    let rd = radial(design, axis0, axis_dir);
+    let rs = radial(solved, axis0, axis_dir);
+    dot(cross(rd, rs), axis_dir).atan2(dot(rd, rs))
+}
+#[test]
+fn interconnect_arm_tips_rotate_with_solved_rocker_angle() {
+    let c = &Project::example_with_interconnect().corners[0];
+    for jounce in [0.03, -0.02] {
+        let s = solve_corner(c, jounce, 0.0).unwrap();
+        let axis0 = c.rocker_axis[0];
+        let axis_dir = {
+            let d = sub(c.rocker_axis[1], axis0);
+            let n = norm(d);
+            [d[0] / n, d[1] / n, d[2] / n]
+        };
+        let shock_angle = swept_angle(c.rocker_shock, s.points.rocker_shock, axis0, axis_dir);
+        let heave_angle = swept_angle(
+            c.rocker_heave_arm.unwrap(),
+            s.points.rocker_heave_arm.unwrap(),
+            axis0,
+            axis_dir,
+        );
+        let roll_angle = swept_angle(
+            c.rocker_roll_arm.unwrap(),
+            s.points.rocker_roll_arm.unwrap(),
+            axis0,
+            axis_dir,
+        );
+        assert!((heave_angle - shock_angle).abs() < 1e-9);
+        assert!((roll_angle - shock_angle).abs() < 1e-9);
+        assert!((shock_angle - s.metrics.rocker_angle_rad).abs() < 1e-9);
+        // A rigid rotation preserves distance from the axis.
+        let r_design = norm(radial(c.rocker_heave_arm.unwrap(), axis0, axis_dir));
+        let r_solved = norm(radial(s.points.rocker_heave_arm.unwrap(), axis0, axis_dir));
+        assert!((r_design - r_solved).abs() < 1e-9);
+    }
+}
+#[test]
+fn interconnect_arm_compression_matches_shock_convention() {
+    let c = &Project::example_with_interconnect().corners[0];
+    let s = solve_corner(c, 0.03, 0.0).unwrap();
+    let expected_heave = distance(c.rocker_heave_arm.unwrap(), c.heave_arm_anchor.unwrap())
+        - distance(
+            s.points.rocker_heave_arm.unwrap(),
+            s.points.heave_arm_anchor.unwrap(),
+        );
+    assert!((s.metrics.heave_arm_compression_m.unwrap() - expected_heave).abs() < 1e-12);
+    let expected_roll = distance(c.rocker_roll_arm.unwrap(), c.roll_arm_anchor.unwrap())
+        - distance(
+            s.points.rocker_roll_arm.unwrap(),
+            s.points.roll_arm_anchor.unwrap(),
+        );
+    assert!((s.metrics.roll_arm_compression_m.unwrap() - expected_roll).abs() < 1e-12);
+}
+#[test]
+fn interconnect_arm_compression_absent_without_hardpoints() {
+    let c = &Project::example().corners[0];
+    let s = solve_corner(c, 0.03, 0.0).unwrap();
+    assert!(s.metrics.heave_arm_compression_m.is_none());
+    assert!(s.metrics.roll_arm_compression_m.is_none());
+    assert!(s.points.rocker_heave_arm.is_none());
+    assert!(s.points.heave_arm_anchor.is_none());
+}
 fn check_links(c: &Corner, s: &CornerState) {
     let p = &s.points;
     for (a, b, x, y) in [

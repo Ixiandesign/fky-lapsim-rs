@@ -4,7 +4,7 @@
 //! Compression derivatives come from exact geometry closure, with finite-difference
 //! refinement. RK4 is conditionally stable: check timestep convergence for each setup.
 //! Select retained component inertia explicitly; contact release remains unsupported.
-use crate::{Chassis, SpringDamper};
+use crate::{AxleInterconnect, Chassis, SpringDamper};
 use crate::{CornerId, Error, Project};
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +109,26 @@ impl Default for RideRequest {
         }
     }
 }
+/// One axle [crate::AxleInterconnect]'s symmetric (heave) and antisymmetric (roll)
+/// channel state at a [RideSample]: compression, compression rate, and combined
+/// spring+damper force, in the same conventions as the corner-level fields on
+/// [RideSample] (positive compression/velocity in compression; see [spring_force]/
+/// [damper_force]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterconnectSample {
+    /// Symmetric (heave) channel compression, metres.
+    pub heave_compression_m: f64,
+    /// Symmetric (heave) channel compression rate, m/s.
+    pub heave_velocity_m_s: f64,
+    /// Symmetric (heave) channel combined spring+damper force, newtons.
+    pub heave_force_n: f64,
+    /// Antisymmetric (roll) channel compression, metres.
+    pub roll_compression_m: f64,
+    /// Antisymmetric (roll) channel compression rate, m/s.
+    pub roll_velocity_m_s: f64,
+    /// Antisymmetric (roll) channel combined spring+damper force, newtons.
+    pub roll_force_n: f64,
+}
 /// One accepted integration sample of a [RideRun].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideSample {
@@ -126,8 +146,17 @@ pub struct RideSample {
     pub compression_velocity_m_s: [f64; 4],
     /// Per-corner combined spring+damper force, newtons; see [spring_force]/[damper_force].
     pub shock_force_n: [f64; 4],
-    /// Vertical prescribed-support reactions, including retained component inertia in mass mode.
+    /// Vertical prescribed-support reactions, including retained component inertia in mass
+    /// mode and any active axle interconnect's contribution (see [InterconnectSample]).
     pub support_reaction_n: [f64; 4],
+    /// Front-axle interconnect state, present exactly when [crate::Project::front_interconnect]
+    /// is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub front_interconnect: Option<InterconnectSample>,
+    /// Rear-axle interconnect state, present exactly when [crate::Project::rear_interconnect]
+    /// is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rear_interconnect: Option<InterconnectSample>,
     /// Total mechanical energy (kinetic + gravitational + spring potential) at this sample, joules.
     pub energy_j: f64,
     /// Positive integral of signed damper force times compression velocity.
@@ -228,7 +257,8 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
                         damper_force(&p.corners[i].spring_damper, s.compression_velocity_m_s[i])
                             * s.compression_velocity_m_s[i]
                     })
-                    .sum();
+                    .sum::<f64>()
+                    + interconnect_dissipated_power(p, &s);
                 let support = (0..4).map(|i| s.support_reaction_n[i] * zd[i]).sum();
                 let ext = (0..3).map(|a| r.external_force[a] * state[a + 3]).sum();
                 Ok([
@@ -462,7 +492,7 @@ fn compression(
     z: [f64; 4],
     rack: [f64; 2],
     tight: bool,
-) -> Result<[f64; 4], Error> {
+) -> Result<([f64; 4], [Option<f64>; 4], [Option<f64>; 4]), Error> {
     let m = crate::Motion {
         heave: q[0],
         roll: q[1],
@@ -470,46 +500,65 @@ fn compression(
         rack_front: rack[0],
         rack_rear: rack[1],
     };
-    Ok(
-        crate::study::simulate_on_road_tolerance(
-            p,
-            &m,
-            z,
-            false,
-            if tight { 1e-12 } else { 1e-8 },
-        )?
-        .corners
-        .map(|c| c.metrics.shock_compression_m),
-    )
+    let corners = crate::study::simulate_on_road_tolerance(
+        p,
+        &m,
+        z,
+        false,
+        if tight { 1e-12 } else { 1e-8 },
+    )?
+    .corners;
+    Ok((
+        corners.each_ref().map(|c| c.metrics.shock_compression_m),
+        corners.each_ref().map(|c| c.metrics.heave_arm_compression_m),
+        corners.each_ref().map(|c| c.metrics.roll_arm_compression_m),
+    ))
 }
 fn compression_map(
     p: &Project,
     q: [f64; 3],
     z: [f64; 4],
 ) -> Result<([f64; 4], [[f64; 3]; 4]), Error> {
-    compression_map_request(p, q, z, &RideRequest::default())
+    let m = compression_map_request(p, q, z, &RideRequest::default())?;
+    Ok((m.c, m.j))
+}
+/// Shock compression/Jacobian (`c`/`j`, unchanged from before this type existed) plus, for
+/// any corner with the relevant hardpoints configured, the interconnect arm compressions
+/// (`heave_arm`/`roll_arm`, `None` where absent) and their chassis-pose Jacobians
+/// (`heave_arm_j`/`roll_arm_j`, meaningful only where the compression is `Some`).
+struct CompressionMap {
+    c: [f64; 4],
+    j: [[f64; 3]; 4],
+    heave_arm: [Option<f64>; 4],
+    heave_arm_j: [[f64; 3]; 4],
+    roll_arm: [Option<f64>; 4],
+    roll_arm_j: [[f64; 3]; 4],
 }
 fn compression_map_request(
     p: &Project,
     q: [f64; 3],
     z: [f64; 4],
     r: &RideRequest,
-) -> Result<([f64; 4], [[f64; 3]; 4]), Error> {
+) -> Result<CompressionMap, Error> {
     let rack = [r.rack_front, r.rack_rear];
     let tight = r.mode == RideMode::RetainedComponentInertia;
-    let c = compression(p, q, z, rack, tight)?;
+    let (c, heave_arm, roll_arm) = compression(p, q, z, rack, tight)?;
     let mut j = [[0.; 3]; 4];
+    let mut heave_arm_j = [[0.; 3]; 4];
+    let mut roll_arm_j = [[0.; 3]; 4];
     // Refined central differences detect reachability failures and nonsmooth branches.
     // Steps exceed closure tolerance; ratios are never silently extrapolated.
     for a in 0..3 {
         let mut previous = [0.; 4];
+        let mut previous_heave_arm = [0.; 4];
+        let mut previous_roll_arm = [0.; 4];
         for (level, eps) in [0.0002, 0.0001].into_iter().enumerate() {
             let mut qp = q;
             let mut qm = q;
             qp[a] += eps;
             qm[a] -= eps;
-            let cp = compression(p, qp, z, rack, tight)?;
-            let cm = compression(p, qm, z, rack, tight)?;
+            let (cp, heave_arm_p, roll_arm_p) = compression(p, qp, z, rack, tight)?;
+            let (cm, heave_arm_m, roll_arm_m) = compression(p, qm, z, rack, tight)?;
             for i in 0..4 {
                 let derivative = (cp[i] - cm[i]) / (2. * eps);
                 if !derivative.is_finite()
@@ -524,10 +573,148 @@ fn compression_map_request(
                 }
                 previous[i] = derivative;
                 j[i][a] = derivative;
+                // These two blocks are independently no-ops (never entered) for any corner
+                // without the relevant interconnect hardpoint, so an arm-less project incurs
+                // no extra computation or error surface here.
+                if let (Some(hp), Some(hm)) = (heave_arm_p[i], heave_arm_m[i]) {
+                    let derivative = (hp - hm) / (2. * eps);
+                    if !derivative.is_finite()
+                        || derivative.abs() > 100.
+                        || (level == 1
+                            && (derivative - previous_heave_arm[i]).abs()
+                                > 0.003 * (1. + derivative.abs()))
+                    {
+                        return Err(error(format!(
+                            "{:?}: singular or discontinuous heave-arm compression Jacobian",
+                            p.corners[i].id
+                        )));
+                    }
+                    previous_heave_arm[i] = derivative;
+                    heave_arm_j[i][a] = derivative;
+                }
+                if let (Some(rp), Some(rm)) = (roll_arm_p[i], roll_arm_m[i]) {
+                    let derivative = (rp - rm) / (2. * eps);
+                    if !derivative.is_finite()
+                        || derivative.abs() > 100.
+                        || (level == 1
+                            && (derivative - previous_roll_arm[i]).abs()
+                                > 0.003 * (1. + derivative.abs()))
+                    {
+                        return Err(error(format!(
+                            "{:?}: singular or discontinuous roll-arm compression Jacobian",
+                            p.corners[i].id
+                        )));
+                    }
+                    previous_roll_arm[i] = derivative;
+                    roll_arm_j[i][a] = derivative;
+                }
             }
         }
     }
-    Ok((c, j))
+    Ok(CompressionMap {
+        c,
+        j,
+        heave_arm,
+        heave_arm_j,
+        roll_arm,
+        roll_arm_j,
+    })
+}
+/// Symmetric (heave) and antisymmetric (roll) interconnect-arm compression and
+/// chassis-pose Jacobian for one axle pairing, linearly combined from the two corners'
+/// own arm compressions/Jacobians in `cm`. Only called for a [crate::AxleInterconnect]
+/// that [Project::validate] has confirmed both `left`/`right` corners carry the relevant
+/// hardpoints for, so the arm data is guaranteed `Some`.
+struct InterconnectGeometry {
+    heave_compression: f64,
+    heave_j: [f64; 3],
+    roll_compression: f64,
+    roll_j: [f64; 3],
+}
+fn interconnect_geometry(
+    p: &Project,
+    cm: &CompressionMap,
+    left: CornerId,
+    right: CornerId,
+) -> InterconnectGeometry {
+    let li = p.corners.iter().position(|c| c.id == left).unwrap();
+    let ri = p.corners.iter().position(|c| c.id == right).unwrap();
+    let heave_l = cm.heave_arm[li].expect("axle interconnect requires heave arm data");
+    let heave_r = cm.heave_arm[ri].expect("axle interconnect requires heave arm data");
+    let roll_l = cm.roll_arm[li].expect("axle interconnect requires roll arm data");
+    let roll_r = cm.roll_arm[ri].expect("axle interconnect requires roll arm data");
+    InterconnectGeometry {
+        heave_compression: (heave_l + heave_r) / 2.,
+        heave_j: std::array::from_fn(|a| (cm.heave_arm_j[li][a] + cm.heave_arm_j[ri][a]) / 2.),
+        roll_compression: (roll_l - roll_r) / 2.,
+        roll_j: std::array::from_fn(|a| (cm.roll_arm_j[li][a] - cm.roll_arm_j[ri][a]) / 2.),
+    }
+}
+/// One configured [crate::AxleInterconnect]'s rate-dependent dynamics at a chassis rate
+/// `v`/road velocity `zd`: combined-channel geometry, spring+damper force, corner array
+/// indices (for the support-reaction chain-rule correction, which needs each corner's own
+/// un-combined arm Jacobian from `cm`, not the combined one here), and the [InterconnectSample]
+/// to report.
+struct InterconnectDynamics {
+    left_index: usize,
+    right_index: usize,
+    heave_j: [f64; 3],
+    roll_j: [f64; 3],
+    f_heave: f64,
+    f_roll: f64,
+    sample: InterconnectSample,
+}
+fn interconnect_dynamics(
+    p: &Project,
+    cm: &CompressionMap,
+    ai: &AxleInterconnect,
+    left: CornerId,
+    right: CornerId,
+    v: [f64; 3],
+    zd: [f64; 4],
+) -> InterconnectDynamics {
+    let geo = interconnect_geometry(p, cm, left, right);
+    let left_index = p.corners.iter().position(|c| c.id == left).unwrap();
+    let right_index = p.corners.iter().position(|c| c.id == right).unwrap();
+    let zd_heave = (zd[left_index] + zd[right_index]) / 2.;
+    let zd_roll = (zd[left_index] - zd[right_index]) / 2.;
+    let u_heave = (0..3).map(|a| geo.heave_j[a] * v[a]).sum::<f64>() - geo.heave_j[0] * zd_heave;
+    let u_roll = (0..3).map(|a| geo.roll_j[a] * v[a]).sum::<f64>() - geo.roll_j[0] * zd_roll;
+    let f_heave = spring_force(&ai.heave, geo.heave_compression) + damper_force(&ai.heave, u_heave);
+    let f_roll = spring_force(&ai.roll, geo.roll_compression) + damper_force(&ai.roll, u_roll);
+    InterconnectDynamics {
+        left_index,
+        right_index,
+        heave_j: geo.heave_j,
+        roll_j: geo.roll_j,
+        f_heave,
+        f_roll,
+        sample: InterconnectSample {
+            heave_compression_m: geo.heave_compression,
+            heave_velocity_m_s: u_heave,
+            heave_force_n: f_heave,
+            roll_compression_m: geo.roll_compression,
+            roll_velocity_m_s: u_roll,
+            roll_force_n: f_roll,
+        },
+    }
+}
+/// Sum of [damper_force]`*`velocity across every configured axle interconnect's heave and
+/// roll channels at `s`; zero (and no [crate::Project::front_interconnect]/
+/// [crate::Project::rear_interconnect] lookups beyond two `None` checks) for a project with
+/// neither configured.
+fn interconnect_dissipated_power(p: &Project, s: &RideSample) -> f64 {
+    let mut total = 0.;
+    for (ai, sample) in [
+        (&p.front_interconnect, &s.front_interconnect),
+        (&p.rear_interconnect, &s.rear_interconnect),
+    ] {
+        if let (Some(ai), Some(sample)) = (ai, sample) {
+            total += damper_force(&ai.heave, sample.heave_velocity_m_s) * sample.heave_velocity_m_s;
+            total += damper_force(&ai.roll, sample.roll_velocity_m_s) * sample.roll_velocity_m_s;
+        }
+    }
+    total
 }
 fn evaluate(
     p: &Project,
@@ -542,11 +729,12 @@ fn evaluate(
     let q = [y[0], y[1], y[2]];
     let v = [y[3], y[4], y[5]];
     let (z, zd) = road_at(p, &r.road, t, left);
-    let (c, j) = compression_map_request(p, q, z, r)?;
-    check_limits(p, c)?;
+    let cm = compression_map_request(p, q, z, r)?;
+    check_limits(p, cm.c)?;
     if r.mode == RideMode::RetainedComponentInertia && crate::mass::active(p) {
-        return evaluate_components(p, r, t, y, q, v, z, zd, c, j);
+        return evaluate_components(p, r, t, y, q, v, z, zd, cm);
     }
+    let (c, j) = (cm.c, cm.j);
     let mut u = [0.; 4];
     let mut force = [0.; 4];
     let mut support = [0.; 4];
@@ -570,6 +758,45 @@ fn evaluate(
         }
         energy += spring_energy(s, c[i]);
     }
+    let mut front_interconnect = None;
+    let mut rear_interconnect = None;
+    for (slot, ai, left, right) in [
+        (
+            &mut front_interconnect,
+            &p.front_interconnect,
+            CornerId::FrontLeft,
+            CornerId::FrontRight,
+        ),
+        (
+            &mut rear_interconnect,
+            &p.rear_interconnect,
+            CornerId::RearLeft,
+            CornerId::RearRight,
+        ),
+    ] {
+        let Some(ai) = ai else { continue };
+        let d = interconnect_dynamics(p, &cm, ai, left, right, v, zd);
+        for a in 0..3 {
+            generalized[a] -= d.heave_j[a] * d.f_heave + d.roll_j[a] * d.f_roll;
+        }
+        support[d.left_index] -= 0.5
+            * (cm.heave_arm_j[d.left_index][0] * d.f_heave
+                + cm.roll_arm_j[d.left_index][0] * d.f_roll);
+        support[d.right_index] -= 0.5
+            * (cm.heave_arm_j[d.right_index][0] * d.f_heave
+                - cm.roll_arm_j[d.right_index][0] * d.f_roll);
+        for i in [d.left_index, d.right_index] {
+            if support[i] < -1e-6 {
+                return Err(error(format!(
+                    "{:?}: fixed contact invalid: negative support reaction {} N",
+                    p.corners[i].id, support[i]
+                )));
+            }
+        }
+        energy += spring_energy(&ai.heave, d.sample.heave_compression_m)
+            + spring_energy(&ai.roll, d.sample.roll_compression_m);
+        *slot = Some(d.sample);
+    }
     let acceleration = inertia_acceleration(&p.chassis, q, v, generalized);
     if !energy.is_finite()
         || !acceleration
@@ -590,6 +817,8 @@ fn evaluate(
         compression_velocity_m_s: u,
         shock_force_n: force,
         support_reaction_n: support,
+        front_interconnect,
+        rear_interconnect,
         energy_j: energy,
         dissipated_work_j: y[6],
         support_work_j: y[7],
@@ -648,10 +877,10 @@ fn evaluate_components(
     v: [f64; 3],
     z: [f64; 4],
     zd: [f64; 4],
-    c: [f64; 4],
-    j: [[f64; 3]; 4],
+    cm: CompressionMap,
 ) -> Result<RideSample, Error> {
     use crate::mass::{Terms, X};
+    let (c, j) = (cm.c, cm.j);
     let x = X::from_row_slice(&[q[0], q[1], q[2], z[0], z[1], z[2], z[3]]);
     let w = X::from_row_slice(&[v[0], v[1], v[2], zd[0], zd[1], zd[2], zd[3]]);
     let zdd = road_acceleration(&r.road, z);
@@ -660,6 +889,39 @@ fn evaluate_components(
         spring_force(&p.corners[i].spring_damper, c[i])
             + damper_force(&p.corners[i].spring_damper, u[i])
     });
+    // Rate-dependent, so computed once here rather than inside `compute`'s per-refinement-
+    // level closure (below) -- geometric compression/Jacobian never depends on `terms`, and
+    // recomputing per refinement level could only introduce spurious variation. Both stay
+    // `None`, and the correction/energy totals below stay all-zero, for a project with
+    // neither axle interconnect configured, so `compute`'s existing arithmetic is unaffected.
+    let front_dynamics = p
+        .front_interconnect
+        .as_ref()
+        .map(|ai| (ai, interconnect_dynamics(p, &cm, ai, CornerId::FrontLeft, CornerId::FrontRight, v, zd)));
+    let rear_dynamics = p
+        .rear_interconnect
+        .as_ref()
+        .map(|ai| (ai, interconnect_dynamics(p, &cm, ai, CornerId::RearLeft, CornerId::RearRight, v, zd)));
+    let all_dynamics = [&front_dynamics, &rear_dynamics];
+    let interconnect_generalized: [f64; 3] = std::array::from_fn(|k| {
+        all_dynamics
+            .iter()
+            .filter_map(|d| d.as_ref())
+            .map(|(_, d)| d.heave_j[k] * d.f_heave + d.roll_j[k] * d.f_roll)
+            .sum()
+    });
+    let mut interconnect_support_correction = [0.; 4];
+    let mut interconnect_energy = 0.;
+    for (ai, d) in all_dynamics.into_iter().filter_map(|d| d.as_ref()) {
+        interconnect_support_correction[d.left_index] += 0.5
+            * (cm.heave_arm_j[d.left_index][0] * d.f_heave
+                + cm.roll_arm_j[d.left_index][0] * d.f_roll);
+        interconnect_support_correction[d.right_index] += 0.5
+            * (cm.heave_arm_j[d.right_index][0] * d.f_heave
+                - cm.roll_arm_j[d.right_index][0] * d.f_roll);
+        interconnect_energy += spring_energy(&ai.heave, d.sample.heave_compression_m)
+            + spring_energy(&ai.roll, d.sample.roll_compression_m);
+    }
     let compute = |mut terms: Terms| -> Result<([f64; 3], [f64; 4], f64), Error> {
         let ch = &p.chassis;
         let a = ch.inertia[1] * q[1].cos().powi(2) + ch.inertia[2] * q[1].sin().powi(2);
@@ -676,7 +938,8 @@ fn evaluate_components(
                 + terms.bias[k]
                 + (0..4)
                     .map(|i| j[i][k] * force[i] + terms.mass[(k, 3 + i)] * zdd[i])
-                    .sum::<f64>();
+                    .sum::<f64>()
+                + interconnect_generalized[k];
         }
         let acc = terms
             .mass
@@ -685,19 +948,23 @@ fn evaluate_components(
             .cholesky()
             .ok_or_else(|| error("component Mqq is not positive definite"))?
             .solve(&rhs);
-        let support = std::array::from_fn(|i| {
+        let mut support = std::array::from_fn(|i| {
             terms.gravity[3 + i] + terms.bias[3 + i] - j[i][0] * force[i]
                 + (0..3).map(|k| terms.mass[(3 + i, k)] * acc[k]).sum::<f64>()
                 + (0..4)
                     .map(|k| terms.mass[(3 + i, 3 + k)] * zdd[k])
                     .sum::<f64>()
         });
+        for i in 0..4 {
+            support[i] -= interconnect_support_correction[i];
+        }
         let energy = 0.5 * w.dot(&(terms.mass * w))
             + terms.potential
             + ch.sprung_mass * GRAVITY * q[0]
             + (0..4)
                 .map(|i| spring_energy(&p.corners[i].spring_damper, c[i]))
-                .sum::<f64>();
+                .sum::<f64>()
+            + interconnect_energy;
         Ok((acc.into(), support, energy))
     };
     // Cache exact stencil positions within this stage only, preserving branch-local solves.
@@ -759,6 +1026,8 @@ fn evaluate_components(
         compression_velocity_m_s: u,
         shock_force_n: force,
         support_reaction_n: support,
+        front_interconnect: front_dynamics.map(|(_, d)| d.sample),
+        rear_interconnect: rear_dynamics.map(|(_, d)| d.sample),
         energy_j: energy,
         dissipated_work_j: y[6],
         support_work_j: y[7],
@@ -772,7 +1041,8 @@ fn static_residual(
     q: [f64; 3],
 ) -> Result<nalgebra::Vector3<f64>, Error> {
     let (z, _) = road_at(p, &r.road, 0., false);
-    let (c, j) = compression_map_request(p, q, z, r)?;
+    let cm = compression_map_request(p, q, z, r)?;
+    let (c, j) = (cm.c, cm.j);
     let component_gravity = if r.mode == RideMode::RetainedComponentInertia
         && crate::mass::active(p)
     {
@@ -805,6 +1075,27 @@ fn static_residual(
     for i in 0..4 {
         for a in 0..3 {
             residual[a] += j[i][a] * spring_force(&p.corners[i].spring_damper, c[i]);
+        }
+    }
+    for (ai, left, right) in [
+        (
+            &p.front_interconnect,
+            CornerId::FrontLeft,
+            CornerId::FrontRight,
+        ),
+        (
+            &p.rear_interconnect,
+            CornerId::RearLeft,
+            CornerId::RearRight,
+        ),
+    ] {
+        if let Some(ai) = ai {
+            let geo = interconnect_geometry(p, &cm, left, right);
+            let f_heave = spring_force(&ai.heave, geo.heave_compression);
+            let f_roll = spring_force(&ai.roll, geo.roll_compression);
+            for a in 0..3 {
+                residual[a] += geo.heave_j[a] * f_heave + geo.roll_j[a] * f_roll;
+            }
         }
     }
     Ok(residual)

@@ -6,12 +6,15 @@ pub mod kinematics;
 pub mod metrics;
 pub mod model;
 pub mod study;
-pub use dynamics::{ride, RideMode, RideRequest, RideRun, RideSample, RideTermination, RoadInput};
+pub use dynamics::{
+    ride, InterconnectSample, RideMode, RideRequest, RideRun, RideSample, RideTermination,
+    RoadInput,
+};
 pub use kinematics::{solve_corner, CornerState, Points};
 pub use metrics::Metrics;
 pub use model::{
-    BodyMass, Chassis, ComponentMasses, Corner, CornerId, Error, Point, Project, PushrodBody,
-    SpringDamper, TireProfile,
+    AxleInterconnect, BodyMass, Chassis, ComponentMasses, Corner, CornerId, Error, Point, Project,
+    PushrodBody, SpringDamper, TireProfile,
 };
 pub use study::{simulate, simulate_on_road, sweep, Motion, Sample, VehicleState};
 pub mod analysis;

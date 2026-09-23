@@ -43,6 +43,13 @@ pub struct Metrics {
     /// Shock compression per metre of upward wheel-center motion at fixed chassis/rack.
     /// Central difference at +/-10 micrometres; absent if either perturbation cannot close.
     pub motion_ratio: Option<f64>,
+    /// Static heave-arm tip-to-anchor distance minus the solved distance, metres; positive
+    /// in compression, same convention as [Metrics::shock_compression_m]. `None` unless
+    /// [crate::Corner::rocker_heave_arm]/[crate::Corner::heave_arm_anchor] are both set.
+    pub heave_arm_compression_m: Option<f64>,
+    /// Static roll-arm tip-to-anchor distance minus the solved distance, metres. `None`
+    /// unless [crate::Corner::rocker_roll_arm]/[crate::Corner::roll_arm_anchor] are both set.
+    pub roll_arm_compression_m: Option<f64>,
     /// Upper wishbone rotation angle about its inner pivot axis, radians, relative
     /// to the design pose.
     pub upper_arm_angle_rad: f64,
@@ -97,8 +104,33 @@ pub fn measure(c: &crate::Corner, p: &crate::Points, angles: [f64; 3]) -> Metric
         shock_length_m: shock,
         shock_compression_m: (v(c.rocker_shock) - v(c.shock_chassis)).norm() - shock,
         motion_ratio: None,
+        heave_arm_compression_m: arm_compression(
+            c.rocker_heave_arm,
+            c.heave_arm_anchor,
+            p.rocker_heave_arm,
+            p.heave_arm_anchor,
+        ),
+        roll_arm_compression_m: arm_compression(
+            c.rocker_roll_arm,
+            c.roll_arm_anchor,
+            p.rocker_roll_arm,
+            p.roll_arm_anchor,
+        ),
         upper_arm_angle_rad: angles[0],
         lower_arm_angle_rad: angles[1],
         rocker_angle_rad: angles[2],
     }
+}
+/// Design tip-to-anchor distance minus solved tip-to-anchor distance, positive in
+/// compression; `None` unless both the corner's static hardpoints and the solved
+/// [crate::Points] carry this arm (i.e. it was configured on the corner at all).
+fn arm_compression(
+    design_tip: Option<crate::Point>,
+    design_anchor: Option<crate::Point>,
+    solved_tip: Option<crate::Point>,
+    solved_anchor: Option<crate::Point>,
+) -> Option<f64> {
+    use crate::kinematics::v;
+    let (t0, a0, t, a) = (design_tip?, design_anchor?, solved_tip?, solved_anchor?);
+    Some((v(t0) - v(a0)).norm() - (v(t) - v(a)).norm())
 }

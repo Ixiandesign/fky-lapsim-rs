@@ -35,6 +35,70 @@ fn reject_bad_component_inertia() {
         .validate()
         .is_err());
 }
+fn massive_with_interconnect() -> (Project, RideRequest) {
+    let mut p = Project::example_with_interconnect();
+    p.chassis.sprung_mass = 300.;
+    p.chassis.inertia = [100., 250., 300.];
+    let mu = 0.1875 / 0.085_f64.sqrt();
+    for c in &mut p.corners {
+        c.spring_damper.preload = 300. * 9.81 / (4. * mu);
+    }
+    let mut value = serde_json::to_value(p).unwrap();
+    for c in value["corners"].as_array_mut().unwrap() {
+        c["component_masses"] = serde_json::json!({"knuckle":{"mass_kg":8.,"center_of_mass":c["wheel_center"],"inertia":[[0.1,0.,0.],[0.,0.1,0.],[0.,0.,0.1]]}});
+    }
+    let p: Project = serde_json::from_value(value).unwrap();
+    let r = RideRequest {
+        mode: dw_core::RideMode::RetainedComponentInertia,
+        duration_s: 0.,
+        solve_equilibrium: false,
+        initial_displacement: [0., 0., 0.],
+        ..Default::default()
+    };
+    (p, r)
+}
+#[test]
+fn support_reaction_sums_to_weight_with_interconnect_in_mass_mode() {
+    // Static only (duration_s stays 0, no initial displacement/velocity): a dynamic,
+    // moving run's knuckle articulation contributes its own inertial "extra" term to
+    // support_reaction_n even on a flat road with no interconnect at all (see
+    // moving_knuckle_inertial_support's explicit "extra" term above) -- that confound is
+    // orthogonal to what this test checks, so it isolates the static case, matching
+    // real_vertical_knuckle_support's proven pattern.
+    let (mut p, mut r) = massive_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().heave.preload = 500.;
+    r.solve_equilibrium = true;
+    let run = ride(&p, &r).unwrap();
+    assert!(run.termination.is_none(), "{:?}", run.termination);
+    let total_mass = 300. + 4. * 8.;
+    let s = &run.samples[0];
+    assert!(
+        (s.support_reaction_n.iter().sum::<f64>() - total_mass * (9.81 + s.acceleration[0]))
+            .abs()
+            < 0.02,
+        "{:?}",
+        s.support_reaction_n
+    );
+    let ic = s.front_interconnect.as_ref().unwrap();
+    assert!(
+        ic.heave_force_n.abs() > 1.,
+        "heave channel should carry real load"
+    );
+}
+#[test]
+fn interconnect_mode_decoupling_holds_in_mass_mode() {
+    let (p, mut r) = massive_with_interconnect();
+    r.solve_equilibrium = false;
+    r.initial_displacement = [0., 0.01, 0.];
+    let plus = ride(&p, &r).unwrap();
+    r.initial_displacement = [0., -0.01, 0.];
+    let minus = ride(&p, &r).unwrap();
+    assert!(plus.termination.is_none() && minus.termination.is_none());
+    let a = plus.samples[0].front_interconnect.as_ref().unwrap();
+    let b = minus.samples[0].front_interconnect.as_ref().unwrap();
+    assert!((a.heave_force_n - b.heave_force_n).abs() < 1e-3);
+    assert!((a.roll_force_n + b.roll_force_n).abs() < 1e-3);
+}
 #[test]
 fn shock_length_limit_is_named() {
     let (p, mut r) = formula_car_demo().unwrap();

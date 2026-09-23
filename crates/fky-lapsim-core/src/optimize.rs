@@ -372,6 +372,18 @@ pub fn parameter_registry(p: &Project) -> Vec<String> {
                 out.push(format!("{base}/spring_damper/{field}"));
             }
         }
+        for (field, v) in [
+            ("rocker_heave_arm", c.rocker_heave_arm),
+            ("heave_arm_anchor", c.heave_arm_anchor),
+            ("rocker_roll_arm", c.rocker_roll_arm),
+            ("roll_arm_anchor", c.roll_arm_anchor),
+        ] {
+            if v.is_some() {
+                for k in 0..3 {
+                    out.push(format!("{base}/{field}/{k}"));
+                }
+            }
+        }
         for (field, b) in [
             ("upper_arm", &c.component_masses.upper_arm),
             ("lower_arm", &c.component_masses.lower_arm),
@@ -386,6 +398,23 @@ pub fn parameter_registry(p: &Project) -> Vec<String> {
                     for j in 0..3 {
                         out.push(format!("{q}/inertia/{k}/{j}"));
                     }
+                }
+            }
+        }
+    }
+    for (base, ai) in [
+        ("/front_interconnect", &p.front_interconnect),
+        ("/rear_interconnect", &p.rear_interconnect),
+    ] {
+        if ai.is_some() {
+            for channel in ["heave", "roll"] {
+                for field in [
+                    "spring_rate",
+                    "preload",
+                    "compression_damping",
+                    "rebound_damping",
+                ] {
+                    out.push(format!("{base}/{channel}/{field}"));
                 }
             }
         }
@@ -424,6 +453,10 @@ pub fn metric_registry() -> Vec<String> {
             "vehicle.rear.wheel_track_m",
             "vehicle.front.contact_track_m",
             "vehicle.rear.contact_track_m",
+            "vehicle.front.heave_wheel_rate_n_per_m",
+            "vehicle.rear.heave_wheel_rate_n_per_m",
+            "vehicle.front.roll_wheel_rate_n_per_m",
+            "vehicle.rear.roll_wheel_rate_n_per_m",
         ]
         .map(str::to_string),
     );
@@ -931,6 +964,17 @@ fn evaluate(
                             for (k, v) in v.as_object().unwrap() {
                                 if let Some(n) = v.get("value").and_then(Value::as_f64) {
                                     metrics.insert(format!("{id:?}:analysis.{k}"), n);
+                                }
+                            }
+                        }
+                        // wheel_track_m/contact_track_m are already covered by the tuple
+                        // list above (plain f64s); this only picks up the OptionalValue
+                        // fields (currently just the interconnect wheel rates).
+                        for (axle, axle_analysis) in [("front", &a.front), ("rear", &a.rear)] {
+                            let v = serde_json::to_value(axle_analysis).unwrap();
+                            for (k, v) in v.as_object().unwrap() {
+                                if let Some(n) = v.get("value").and_then(Value::as_f64) {
+                                    metrics.insert(format!("vehicle.{axle}.{k}"), n);
                                 }
                             }
                         }

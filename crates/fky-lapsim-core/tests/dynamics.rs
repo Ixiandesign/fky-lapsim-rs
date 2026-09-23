@@ -212,6 +212,105 @@ fn coupled_force_matches_independent_potential_gradient_and_road_work() {
     close(s.acceleration[2], (force[2] - ap * v[1] * v[2]) / a, 2e-4);
 }
 
+fn demo_with_interconnect() -> Project {
+    let mut p = Project::example_with_interconnect();
+    p.chassis.sprung_mass = 300.;
+    p.chassis.inertia = [100., 250., 300.];
+    let mu = 0.1875 / 0.085_f64.sqrt();
+    for c in &mut p.corners {
+        c.spring_damper.preload = 300. * 9.81 / (4. * mu);
+    }
+    p
+}
+fn single_sample(p: &Project, displacement: [f64; 3]) -> RideSample {
+    let r = RideRequest {
+        duration_s: 0.,
+        solve_equilibrium: false,
+        initial_displacement: displacement,
+        ..Default::default()
+    };
+    let run = ride(p, &r).unwrap();
+    assert!(run.termination.is_none(), "{:?}", run.termination);
+    run.samples.into_iter().next().unwrap()
+}
+#[test]
+fn ride_sample_has_no_interconnect_fields_without_configuration() {
+    let (p, r) = formula_car_demo().unwrap();
+    let run = ride(&p, &r).unwrap();
+    assert!(run.termination.is_none(), "{:?}", run.termination);
+    for s in &run.samples {
+        assert!(s.front_interconnect.is_none());
+        assert!(s.rear_interconnect.is_none());
+    }
+}
+#[test]
+fn pure_heave_excites_only_the_heave_interconnect_channel() {
+    let p = demo_with_interconnect();
+    let s = single_sample(&p, [0.005, 0., 0.]);
+    let ic = s.front_interconnect.expect("front interconnect configured");
+    // roll_arm_compression is an exact function of the (mirror-symmetric) rocker angle,
+    // and pure heave gives both corners of the pair the identical rocker angle -- so the
+    // roll channel's compression, and hence its zero-preload force, is exactly zero at any
+    // heave magnitude, not just to first order.
+    close(ic.roll_compression_m, 0., 1e-9);
+    close(ic.roll_force_n, 0., 1e-4);
+    assert!(ic.heave_force_n.abs() > 1., "heave channel should carry real load");
+}
+#[test]
+fn pure_roll_mirrors_the_heave_channel_and_flips_the_roll_channel() {
+    let p = demo_with_interconnect();
+    let plus = single_sample(&p, [0., 0.01, 0.]);
+    let minus = single_sample(&p, [0., -0.01, 0.]);
+    let ic_plus = plus.front_interconnect.expect("front interconnect configured");
+    let ic_minus = minus.front_interconnect.expect("front interconnect configured");
+    // Distance is invariant under the left/right mirror reflection that relates a +roll
+    // and -roll chassis pose, so heave_arm_compression (built from tip-to-anchor distances)
+    // is an exact even function of roll: this is the mode-decoupling guarantee itself, not
+    // a small-signal approximation, and holds at this (moderate) 0.01 rad magnitude.
+    close(ic_plus.heave_compression_m, ic_minus.heave_compression_m, 1e-9);
+    close(ic_plus.heave_force_n, ic_minus.heave_force_n, 1e-4);
+    // roll_arm_compression is correspondingly an exact odd function of roll, and this
+    // fixture's roll spring has zero preload, so its force flips sign exactly too.
+    close(ic_plus.roll_compression_m, -ic_minus.roll_compression_m, 1e-9);
+    close(ic_plus.roll_force_n, -ic_minus.roll_force_n, 1e-4);
+    assert!(ic_plus.roll_force_n.abs() > 1., "roll channel should carry real load");
+}
+#[test]
+fn support_reaction_sums_to_weight_with_interconnect_active() {
+    let mut p = demo_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().heave.preload = 500.;
+    let r = RideRequest {
+        duration_s: 0.05,
+        initial_displacement: [0.001, 0.0005, 0.],
+        ..Default::default()
+    };
+    let run = ride(&p, &r).unwrap();
+    assert!(run.termination.is_none(), "{:?}", run.termination);
+    for s in &run.samples {
+        close(
+            s.support_reaction_n.iter().sum(),
+            300. * (9.81 + s.acceleration[0]),
+            1e-6,
+        );
+        let ic = s.front_interconnect.as_ref().unwrap();
+        assert!(ic.heave_force_n.abs() > 1., "heave channel should carry real load");
+    }
+}
+#[test]
+fn energy_balances_with_interconnect_springs_and_dampers_active() {
+    let p = demo_with_interconnect();
+    let r = RideRequest {
+        duration_s: 0.1,
+        solve_equilibrium: true,
+        initial_displacement: [0.006, 0.003, 0.],
+        ..Default::default()
+    };
+    let run = ride(&p, &r).unwrap();
+    assert!(run.termination.is_none(), "{:?}", run.termination);
+    let last = run.samples.last().unwrap();
+    assert!(last.energy_balance_error_j.abs() < 1e-3);
+    assert!(last.dissipated_work_j > 0.);
+}
 #[test]
 fn invalid_contact_and_unreachable_geometry_are_diagnostic_not_success() {
     let p = demo();

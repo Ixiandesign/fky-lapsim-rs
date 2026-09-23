@@ -84,6 +84,15 @@ pub struct AxleAnalysis {
     /// contact-to-projected-center lines in the world y-z plane. See
     /// [geometric_roll_center].
     pub geometric_roll_center_yz_m: OptionalValue<[f64; 2]>,
+    /// Tangent wheel-rate of this axle's [crate::AxleInterconnect] heave channel, from
+    /// symmetric (both corners moved together) upward wheel-center motion at fixed
+    /// chassis/rack; see [crate::dynamics::wheel_rate]. `None` unless this axle has a
+    /// configured interconnect.
+    pub heave_wheel_rate_n_per_m: OptionalValue<f64>,
+    /// Tangent wheel-rate of this axle's [crate::AxleInterconnect] roll channel, from
+    /// antisymmetric (corners moved oppositely) upward wheel-center motion at fixed
+    /// chassis/rack. `None` unless this axle has a configured interconnect.
+    pub roll_wheel_rate_n_per_m: OptionalValue<f64>,
 }
 /// Complete expanded geometry analysis for one [Motion]: the underlying solved
 /// [VehicleState] plus per-corner derivatives/centers and per-axle track/roll-center
@@ -351,9 +360,71 @@ pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Er
     let fr = index(CornerId::FrontRight);
     let rl = index(CornerId::RearLeft);
     let rr = index(CornerId::RearRight);
-    let axle = |l: usize, r: usize| {
+    // Symmetric (heave)/antisymmetric (roll) tangent wheel-rate for one axle's
+    // AxleInterconnect, from central differences of the combined interconnect-arm
+    // compression against symmetric/antisymmetric world wheel-center motion (same
+    // primitive, `at_world_height`, and step `h` as the per-corner derivatives above;
+    // `mid` reuses the already-solved `state` rather than a third perturbed solve).
+    let interconnect_rate = |ai: Option<&crate::AxleInterconnect>, l: usize, r: usize, rack: f64| {
+        let absent = |reason: &str| (OptionalValue::absent(reason), OptionalValue::absent(reason));
+        let Some(ai) = ai else {
+            return absent("no axle interconnect configured");
+        };
+        let (cl, sl) = (&p.corners[l], &state.corners[l]);
+        let (cr, sr) = (&p.corners[r], &state.corners[r]);
+        let (zl, zr) = (sl.points.wheel_center[2], sr.points.wheel_center[2]);
+        let samples = (
+            at_world_height(cl, sl, &frame, rack, zl - h),
+            at_world_height(cl, sl, &frame, rack, zl + h),
+            at_world_height(cr, sr, &frame, rack, zr - h),
+            at_world_height(cr, sr, &frame, rack, zr + h),
+        );
+        let (l_lo, l_hi, r_lo, r_hi) = match samples {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            _ => return absent("perturbation failed"),
+        };
+        let combine = |a: Option<f64>, b: Option<f64>, sign: f64| a.zip(b).map(|(a, b)| (a + sign * b) / 2.0);
+        let heave = |s: &crate::CornerState| s.metrics.heave_arm_compression_m;
+        let roll = |s: &crate::CornerState| s.metrics.roll_arm_compression_m;
+        let rate = |mid: Option<f64>, hi: Option<f64>, lo: Option<f64>, spring: &crate::SpringDamper| {
+            let (Some(mid), Some(hi), Some(lo)) = (mid, hi, lo) else {
+                return OptionalValue::absent("interconnect hardpoints not configured on this axle");
+            };
+            let ratio = (hi - lo) / (2.0 * h);
+            let gradient = (hi - 2.0 * mid + lo) / (h * h);
+            let tangent = if let Some(curve) = &spring.spring_curve {
+                if curve.iter().any(|point| (point[0] - mid).abs() < 1e-10) {
+                    None
+                } else {
+                    Some(
+                        curve
+                            .windows(2)
+                            .find(|w| mid > w[0][0] && mid < w[1][0])
+                            .map_or(0.0, |w| (w[1][1] - w[0][1]) / (w[1][0] - w[0][0])),
+                    )
+                }
+            } else {
+                Some(spring.spring_rate)
+            };
+            match tangent {
+                Some(k) => OptionalValue::known(wheel_rate(
+                    k,
+                    crate::dynamics::spring_force(spring, mid),
+                    ratio,
+                    gradient,
+                )),
+                None => OptionalValue::absent("spring force table knot: tangent undefined"),
+            }
+        };
+        (
+            rate(combine(heave(sl), heave(sr), 1.0), combine(heave(&l_hi), heave(&r_hi), 1.0), combine(heave(&l_lo), heave(&r_lo), 1.0), &ai.heave),
+            rate(combine(roll(sl), roll(sr), -1.0), combine(roll(&l_hi), roll(&r_lo), -1.0), combine(roll(&l_lo), roll(&r_hi), -1.0), &ai.roll),
+        )
+    };
+    let axle = |l: usize, r: usize, ai: Option<&crate::AxleInterconnect>, rack: f64| {
         let lp = &state.corners[l].points;
         let rp = &state.corners[r].points;
+        let (heave_wheel_rate_n_per_m, roll_wheel_rate_n_per_m) = interconnect_rate(ai, l, r, rack);
         AxleAnalysis {
             wheel_track_m: lp.wheel_center[1] - rp.wheel_center[1],
             contact_track_m: lp.contact_point[1] - rp.contact_point[1],
@@ -363,10 +434,12 @@ pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Er
                 [rp.contact_point[1], rp.contact_point[2]],
                 &corners[r].projected_front_view_ic,
             ),
+            heave_wheel_rate_n_per_m,
+            roll_wheel_rate_n_per_m,
         }
     };
-    let front = axle(fl, fr);
-    let rear = axle(rl, rr);
+    let front = axle(fl, fr, p.front_interconnect.as_ref(), m.rack_front);
+    let rear = axle(rl, rr, p.rear_interconnect.as_ref(), m.rack_rear);
     let left_wheelbase_m =
         state.corners[fl].points.wheel_center[0] - state.corners[rl].points.wheel_center[0];
     let right_wheelbase_m =

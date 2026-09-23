@@ -208,6 +208,41 @@ pub struct Corner {
     /// Spring and damper force law for this corner's shock.
     #[serde(default)]
     pub spring_damper: SpringDamper,
+    /// Design-pose tip of a third rocker arm reacting the axle's symmetric
+    /// (heave) motion, rigidly fixed to the same rocker body as
+    /// [Corner::rocker_pushrod]/[Corner::rocker_shock]. Present only when this
+    /// corner participates in an [AxleInterconnect]; see
+    /// [Project::front_interconnect]/[Project::rear_interconnect].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocker_heave_arm: Option<Point>,
+    /// Virtual chassis-fixed reference point the heave arm's compression is
+    /// measured against, the same role [Corner::shock_chassis] plays for
+    /// [Corner::rocker_shock]. This is a lumped-spring idealization, not a
+    /// claim that a real interconnect mechanism's far end is chassis-fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heave_arm_anchor: Option<Point>,
+    /// Design-pose tip of a third rocker arm reacting the axle's antisymmetric
+    /// (roll) motion. See [Corner::rocker_heave_arm].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rocker_roll_arm: Option<Point>,
+    /// Virtual chassis-fixed reference point the roll arm's compression is
+    /// measured against. See [Corner::heave_arm_anchor].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roll_arm_anchor: Option<Point>,
+}
+
+/// A pair of spring/damper elements coupling one axle's two corners: [AxleInterconnect::heave]
+/// reacts the symmetric (average) component of the two corners' interconnect-arm travel,
+/// [AxleInterconnect::roll] reacts the antisymmetric (difference) component. This is a
+/// lumped-spring idealization of a third-spring/T-bar/ARB-blade mechanism, not a modeled
+/// secondary rigid body; see `docs/research/suspension-research.md` section 6. Both fields
+/// are always configured together in this schema version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AxleInterconnect {
+    /// Spring/damper reacting symmetric (heave) interconnect-arm travel.
+    pub heave: SpringDamper,
+    /// Spring/damper reacting antisymmetric (roll) interconnect-arm travel.
+    pub roll: SpringDamper,
 }
 
 /// A complete suspension model: schema version, name, chassis, and all four corners.
@@ -221,6 +256,14 @@ pub struct Project {
     /// Sprung-body mass properties.
     #[serde(default)]
     pub chassis: Chassis,
+    /// Optional mode-decoupled heave/roll spring system coupling `FrontLeft`/`FrontRight`.
+    /// When present, both corners must have all four interconnect hardpoints configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub front_interconnect: Option<AxleInterconnect>,
+    /// Optional mode-decoupled heave/roll spring system coupling `RearLeft`/`RearRight`.
+    /// When present, both corners must have all four interconnect hardpoints configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rear_interconnect: Option<AxleInterconnect>,
     /// Exactly one of each CornerId; array order does not identify a corner.
     pub corners: [Corner; 4],
 }
@@ -241,8 +284,10 @@ impl std::error::Error for Error {}
 impl Project {
     /// Checks schema version; finite, positive, triangle-inequality-satisfying chassis
     /// inertia; a finite chassis center of mass; that all four corner IDs are present
-    /// and distinct; and each corner's own [Corner::validate]. Kinematics, analysis,
-    /// ride, and optimization entry points call this internally.
+    /// and distinct; each corner's own [Corner::validate]; and, for each configured
+    /// [AxleInterconnect], its spring/damper laws and that both paired corners carry all
+    /// four interconnect hardpoints. Kinematics, analysis, ride, and optimization entry
+    /// points call this internally.
     pub fn validate(&self) -> Result<(), Error> {
         require(self.schema_version == 1, "unsupported schema version")?;
         require(
@@ -271,6 +316,39 @@ impl Project {
                 "duplicate corner ID: all four distinct corner IDs are required",
             )?;
             corner.validate()?;
+        }
+        for (axle, interconnect, left_id, right_id) in [
+            (
+                "front",
+                &self.front_interconnect,
+                CornerId::FrontLeft,
+                CornerId::FrontRight,
+            ),
+            (
+                "rear",
+                &self.rear_interconnect,
+                CornerId::RearLeft,
+                CornerId::RearRight,
+            ),
+        ] {
+            if let Some(ai) = interconnect {
+                validate_spring_damper(&ai.heave, &format!("{axle} interconnect heave"), false)?;
+                validate_spring_damper(&ai.roll, &format!("{axle} interconnect roll"), false)?;
+                for id in [left_id, right_id] {
+                    // Corner IDs are already confirmed complete and pairwise distinct above.
+                    let corner = self.corners.iter().find(|c| c.id == id).unwrap();
+                    require(
+                        corner.rocker_heave_arm.is_some()
+                            && corner.heave_arm_anchor.is_some()
+                            && corner.rocker_roll_arm.is_some()
+                            && corner.roll_arm_anchor.is_some(),
+                        format!(
+                            "{id:?}: all four interconnect hardpoints are required when \
+                             {axle}_interconnect is configured"
+                        ),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -304,12 +382,18 @@ impl Project {
                 rocker_shock: p(0.0, 0.4, 0.95),
                 shock_chassis: p(0.0, 0.15, 0.8),
                 spring_damper: SpringDamper::default(),
+                rocker_heave_arm: None,
+                heave_arm_anchor: None,
+                rocker_roll_arm: None,
+                roll_arm_anchor: None,
             }
         };
         Self {
             schema_version: 1,
             name: "Analytic parallelogram".into(),
             chassis: Chassis::default(),
+            front_interconnect: None,
+            rear_interconnect: None,
             corners: [
                 corner(CornerId::FrontLeft, 1.3, 1.0),
                 corner(CornerId::FrontRight, 1.3, -1.0),
@@ -317,6 +401,39 @@ impl Project {
                 corner(CornerId::RearRight, -1.3, -1.0),
             ],
         }
+    }
+
+    /// [Project::example], with a front-axle mode-decoupled heave/roll [AxleInterconnect]
+    /// added: every corner gets a symmetric third-arm pair (`rocker_heave_arm`/
+    /// `heave_arm_anchor`, `rocker_roll_arm`/`roll_arm_anchor`), and `front_interconnect`
+    /// is configured. `rear_interconnect` is left `None`, so this fixture also exercises a
+    /// project that mixes an interconnected front axle with an independent-spring rear axle.
+    pub fn example_with_interconnect() -> Self {
+        let mut project = Self::example();
+        for corner in &mut project.corners {
+            let (x, side) = match corner.id {
+                CornerId::FrontLeft => (1.3, 1.0),
+                CornerId::FrontRight => (1.3, -1.0),
+                CornerId::RearLeft => (-1.3, 1.0),
+                CornerId::RearRight => (-1.3, -1.0),
+            };
+            let p = |dx: f64, y: f64, z: f64| [x + dx, side * y, z];
+            corner.rocker_heave_arm = Some(p(0.0, 0.4, 0.65));
+            corner.heave_arm_anchor = Some(p(0.0, 0.6, 0.8));
+            corner.rocker_roll_arm = Some(p(0.0, 0.25, 0.8));
+            corner.roll_arm_anchor = Some(p(0.0, 0.4, 1.0));
+        }
+        project.front_interconnect = Some(AxleInterconnect {
+            heave: SpringDamper {
+                spring_rate: 40_000.0,
+                ..SpringDamper::default()
+            },
+            roll: SpringDamper {
+                spring_rate: 20_000.0,
+                ..SpringDamper::default()
+            },
+        });
+        project
     }
 }
 
@@ -358,10 +475,12 @@ fn triangle(a: Point, b: Point, c: Point) -> bool {
 
 impl Corner {
     /// Checks finite/positive/symmetric component masses and inertias (when present);
-    /// consistent shock length limits; finite hardpoints; distinct axis endpoints;
-    /// nondegenerate wishbone/rocker triangles; positive tire/spring parameters; the
-    /// torus width/radius constraint; and any spring/damper force table's shape.
-    /// Called by [Project::validate] for every corner.
+    /// the corner's own spring/damper law (see [validate_spring_damper]); finite
+    /// hardpoints; distinct axis endpoints; nondegenerate wishbone/rocker triangles;
+    /// positive tire parameters; the torus width/radius constraint; and, for each
+    /// interconnect arm, that it is paired with its anchor, finite, distinct from its
+    /// anchor, and forms a nondegenerate lever with the rocker axis. Called by
+    /// [Project::validate] for every corner.
     pub fn validate(&self) -> Result<(), Error> {
         let c = self;
         for (name, body) in [
@@ -391,15 +510,33 @@ impl Corner {
                 }
             }
         }
-        let s = &c.spring_damper;
-        require(
-            s.min_length_m
-                .iter()
-                .chain(s.max_length_m.iter())
-                .all(|v| v.is_finite() && *v > 0.)
-                && !matches!((s.min_length_m,s.max_length_m),(Some(a),Some(b)) if a>b),
-            format!("{:?}: invalid shock length limits", c.id),
-        )?;
+        validate_spring_damper(&c.spring_damper, &format!("{:?}", c.id), true)?;
+        for (label, arm, anchor) in [
+            ("heave", c.rocker_heave_arm, c.heave_arm_anchor),
+            ("roll", c.rocker_roll_arm, c.roll_arm_anchor),
+        ] {
+            require(
+                arm.is_some() == anchor.is_some(),
+                format!(
+                    "{:?}: {label} arm and its anchor must be configured together",
+                    c.id
+                ),
+            )?;
+            if let (Some(arm), Some(anchor)) = (arm, anchor) {
+                require(
+                    arm.iter().chain(anchor.iter()).all(|x| x.is_finite()),
+                    format!("{:?}: nonfinite {label} interconnect hardpoint", c.id),
+                )?;
+                require(
+                    distinct(arm, anchor),
+                    format!("{:?}: degenerate {label} interconnect arm", c.id),
+                )?;
+                require(
+                    triangle(c.rocker_axis[0], c.rocker_axis[1], arm),
+                    format!("{:?}: degenerate rocker {label} arm lever", c.id),
+                )?;
+            }
+        }
         let points = [
             c.rack_axis[0],
             c.rack_axis[1],
@@ -462,11 +599,7 @@ impl Corner {
         ] {
             require(triangle(a, b, d), format!("{:?}: degenerate {label}", c.id))?;
         }
-        for (label, v) in [
-            ("tire radius", c.tire_radius),
-            ("tire width", c.tire_width),
-            ("spring rate", c.spring_damper.spring_rate),
-        ] {
+        for (label, v) in [("tire radius", c.tire_radius), ("tire width", c.tire_width)] {
             require(
                 v.is_finite() && v > 0.0,
                 format!("{:?}: {label} must be finite and positive", c.id),
@@ -476,47 +609,72 @@ impl Corner {
             c.tire_profile != TireProfile::Torus || c.tire_width / 2.0 < c.tire_radius,
             "torus requires half width smaller than outer radius",
         )?;
-        for (label, v) in [
-            ("preload", c.spring_damper.preload),
-            ("compression damping", c.spring_damper.compression_damping),
-            ("rebound damping", c.spring_damper.rebound_damping),
-        ] {
-            require(
-                v.is_finite() && v >= 0.0,
-                format!("{:?}: {label} must be finite and nonnegative", c.id),
-            )?;
-        }
-        for (name, curve, damper) in [
-            ("spring", &c.spring_damper.spring_curve, false),
-            (
-                "compression damper",
-                &c.spring_damper.compression_curve,
-                true,
-            ),
-            ("rebound damper", &c.spring_damper.rebound_curve, true),
-        ] {
-            if let Some(curve) = curve {
-                require(
-                    curve.len() >= 2
-                        && curve.len() <= 10000
-                        && curve.iter().flatten().all(|x| x.is_finite())
-                        && curve.windows(2).all(|w| {
-                            w[1][0] > w[0][0]
-                                && ((w[1][1] - w[0][1]) / (w[1][0] - w[0][0])).is_finite()
-                        }),
-                    format!("{:?}: invalid {name} force table", c.id),
-                )?;
-                if damper {
-                    require(
-                        curve[0] == [0.0, 0.0] && curve.iter().all(|p| p[0] >= 0.0 && p[1] >= 0.0),
-                        format!(
-                            "{:?}: {name} table must start at zero and remain passive",
-                            c.id
-                        ),
-                    )?;
-                }
-            }
-        }
         Ok(())
     }
+}
+
+/// Checks finite length limits (when `allow_length_limits`, else rejects them outright,
+/// since interconnect springs have no single physical shock length); positive spring rate;
+/// nonnegative preload/damping; and any force table's shape. Shared by [Corner::validate]
+/// for a corner's own [SpringDamper] and by [Project::validate] for [AxleInterconnect]
+/// springs. `context` prefixes every message, e.g. a corner's `{:?}` id or an axle label.
+fn validate_spring_damper(
+    s: &SpringDamper,
+    context: &str,
+    allow_length_limits: bool,
+) -> Result<(), Error> {
+    if allow_length_limits {
+        require(
+            s.min_length_m
+                .iter()
+                .chain(s.max_length_m.iter())
+                .all(|v| v.is_finite() && *v > 0.)
+                && !matches!((s.min_length_m, s.max_length_m), (Some(a), Some(b)) if a > b),
+            format!("{context}: invalid shock length limits"),
+        )?;
+    } else {
+        require(
+            s.min_length_m.is_none() && s.max_length_m.is_none(),
+            format!("{context}: shock length limits are not supported on interconnect springs"),
+        )?;
+    }
+    require(
+        s.spring_rate.is_finite() && s.spring_rate > 0.0,
+        format!("{context}: spring rate must be finite and positive"),
+    )?;
+    for (label, v) in [
+        ("preload", s.preload),
+        ("compression damping", s.compression_damping),
+        ("rebound damping", s.rebound_damping),
+    ] {
+        require(
+            v.is_finite() && v >= 0.0,
+            format!("{context}: {label} must be finite and nonnegative"),
+        )?;
+    }
+    for (name, curve, damper) in [
+        ("spring", &s.spring_curve, false),
+        ("compression damper", &s.compression_curve, true),
+        ("rebound damper", &s.rebound_curve, true),
+    ] {
+        if let Some(curve) = curve {
+            require(
+                curve.len() >= 2
+                    && curve.len() <= 10000
+                    && curve.iter().flatten().all(|x| x.is_finite())
+                    && curve.windows(2).all(|w| {
+                        w[1][0] > w[0][0]
+                            && ((w[1][1] - w[0][1]) / (w[1][0] - w[0][0])).is_finite()
+                    }),
+                format!("{context}: invalid {name} force table"),
+            )?;
+            if damper {
+                require(
+                    curve[0] == [0.0, 0.0] && curve.iter().all(|p| p[0] >= 0.0 && p[1] >= 0.0),
+                    format!("{context}: {name} table must start at zero and remain passive"),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }

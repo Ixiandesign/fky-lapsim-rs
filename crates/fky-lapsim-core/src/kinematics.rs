@@ -37,6 +37,14 @@ pub struct Points {
     pub rocker_shock: Point,
     /// Shock's chassis-side attachment point (chassis-fixed).
     pub shock_chassis: Point,
+    /// Heave-arm tip at the solved rocker angle, when [Corner::rocker_heave_arm] is set.
+    pub rocker_heave_arm: Option<Point>,
+    /// Heave arm's chassis-fixed virtual anchor, when [Corner::heave_arm_anchor] is set.
+    pub heave_arm_anchor: Option<Point>,
+    /// Roll-arm tip at the solved rocker angle, when [Corner::rocker_roll_arm] is set.
+    pub rocker_roll_arm: Option<Point>,
+    /// Roll arm's chassis-fixed virtual anchor, when [Corner::roll_arm_anchor] is set.
+    pub roll_arm_anchor: Option<Point>,
     /// Tire's ground/road support (contact representative) point at the solved pose.
     pub contact_point: Point,
 }
@@ -389,6 +397,14 @@ fn state(
             .point(rotate_axis(c.rocker_shock, c.rocker_axis, ra))
             .into(),
         shock_chassis: fixed(c.shock_chassis),
+        rocker_heave_arm: c
+            .rocker_heave_arm
+            .map(|p| f.point(rotate_axis(p, c.rocker_axis, ra)).into()),
+        heave_arm_anchor: c.heave_arm_anchor.map(fixed),
+        rocker_roll_arm: c
+            .rocker_roll_arm
+            .map(|p| f.point(rotate_axis(p, c.rocker_axis, ra)).into()),
+        roll_arm_anchor: c.roll_arm_anchor.map(fixed),
         contact_point: [0.0; 3],
     };
     let axis = (v(points.spindle_axis[1]) - v(points.spindle_axis[0])).normalize();

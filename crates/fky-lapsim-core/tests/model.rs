@@ -48,6 +48,75 @@ fn invalid_mass_and_force_parameters_are_rejected() {
     assert!(p.validate().is_err());
 }
 #[test]
+fn example_with_interconnect_validates() {
+    Project::example_with_interconnect().validate().unwrap();
+}
+#[test]
+fn interconnect_hardpoints_require_pairing() {
+    let mut p = Project::example_with_interconnect();
+    p.corners[0].heave_arm_anchor = None;
+    assert!(p.validate().is_err());
+    let mut p = Project::example_with_interconnect();
+    p.corners[0].rocker_roll_arm = None;
+    assert!(p.validate().is_err());
+}
+#[test]
+fn interconnect_requires_both_corners_fully_configured() {
+    let mut p = Project::example_with_interconnect();
+    p.corners[1].rocker_heave_arm = None;
+    p.corners[1].heave_arm_anchor = None;
+    assert!(p.validate().is_err());
+}
+#[test]
+fn corner_may_carry_interconnect_hardpoints_without_an_active_interconnect() {
+    // example_with_interconnect() gives every corner the hardpoints but only configures
+    // front_interconnect; rear_interconnect stays None and the project still validates.
+    let p = Project::example_with_interconnect();
+    assert!(p.corners[2].rocker_heave_arm.is_some());
+    assert!(p.rear_interconnect.is_none());
+    p.validate().unwrap();
+}
+#[test]
+fn interconnect_spring_length_limits_are_rejected() {
+    let mut p = Project::example_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().heave.min_length_m = Some(0.01);
+    assert!(p.validate().is_err());
+    let mut p = Project::example_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().roll.max_length_m = Some(0.5);
+    assert!(p.validate().is_err());
+}
+#[test]
+fn interconnect_spring_rate_and_damping_validated() {
+    let mut p = Project::example_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().heave.spring_rate = -1.0;
+    assert!(p.validate().is_err());
+    let mut p = Project::example_with_interconnect();
+    p.front_interconnect.as_mut().unwrap().roll.rebound_damping = -1.0;
+    assert!(p.validate().is_err());
+}
+#[test]
+fn degenerate_interconnect_lever_is_rejected() {
+    let mut p = Project::example_with_interconnect();
+    let axis = p.corners[0].rocker_axis;
+    // Place the heave arm tip on the rocker axis line: degenerate lever.
+    p.corners[0].rocker_heave_arm = Some(axis[0]);
+    assert!(p.validate().is_err());
+}
+#[test]
+fn nonfinite_interconnect_hardpoint_is_rejected() {
+    let mut p = Project::example_with_interconnect();
+    p.corners[0].roll_arm_anchor = Some([f64::NAN, 0.0, 0.0]);
+    assert!(p.validate().is_err());
+}
+#[test]
+fn interconnect_round_trips_through_json() {
+    let p = Project::example_with_interconnect();
+    let json = serde_json::to_string(&p).unwrap();
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, p);
+    back.validate().unwrap();
+}
+#[test]
 fn ownership_round_trips_and_defaults_are_backward_compatible() {
     for owner in [
         PushrodBody::UpperArm,

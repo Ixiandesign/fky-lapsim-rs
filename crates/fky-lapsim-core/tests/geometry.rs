@@ -264,3 +264,74 @@ fn skew_first_derivatives_match_independent_corner_samples() {
     assert!((camber - a.corners[0].camber_gain_deg_per_m.value.unwrap()).abs() < 0.002);
     assert!((toe - a.corners[0].toe_gain_deg_per_m.value.unwrap()).abs() < 0.002);
 }
+#[test]
+fn interconnect_wheel_rate_absent_without_configuration_present_when_configured() {
+    let p = Project::example();
+    let a = analyze(&p, &Motion::default()).unwrap();
+    assert!(a.front.heave_wheel_rate_n_per_m.value.is_none());
+    assert!(a.front.roll_wheel_rate_n_per_m.value.is_none());
+
+    let p = Project::example_with_interconnect();
+    let a = analyze(&p, &Motion::default()).unwrap();
+    let heave = a
+        .front
+        .heave_wheel_rate_n_per_m
+        .value
+        .expect("front heave interconnect configured");
+    let roll = a
+        .front
+        .roll_wheel_rate_n_per_m
+        .value
+        .expect("front roll interconnect configured");
+    assert!(heave > 0.0, "{heave}");
+    assert!(roll > 0.0, "{roll}");
+    // example_with_interconnect() only configures front_interconnect.
+    assert!(a.rear.heave_wheel_rate_n_per_m.value.is_none());
+    assert!(a.rear.roll_wheel_rate_n_per_m.value.is_none());
+}
+#[test]
+fn interconnect_wheel_rate_matches_independent_corner_samples() {
+    let p = Project::example_with_interconnect();
+    let a = analyze(&p, &Motion::default()).unwrap();
+    let fl = &p.corners[0];
+    let fr = &p.corners[1];
+    assert_eq!(fl.id, CornerId::FrontLeft);
+    assert_eq!(fr.id, CornerId::FrontRight);
+    let h = 0.0007;
+    let fl_hi = solve_corner(fl, h, 0.0).unwrap();
+    let fl_lo = solve_corner(fl, -h, 0.0).unwrap();
+    let fr_hi = solve_corner(fr, h, 0.0).unwrap();
+    let fr_lo = solve_corner(fr, -h, 0.0).unwrap();
+    // Symmetric (heave) perturbation: both corners jounce together.
+    let heave_hi = (fl_hi.metrics.heave_arm_compression_m.unwrap()
+        + fr_hi.metrics.heave_arm_compression_m.unwrap())
+        / 2.0;
+    let heave_lo = (fl_lo.metrics.heave_arm_compression_m.unwrap()
+        + fr_lo.metrics.heave_arm_compression_m.unwrap())
+        / 2.0;
+    let heave_ratio = (heave_hi - heave_lo) / (2.0 * h);
+    // Antisymmetric (roll) perturbation: left up, right down.
+    let roll_hi = (fl_hi.metrics.roll_arm_compression_m.unwrap()
+        - fr_lo.metrics.roll_arm_compression_m.unwrap())
+        / 2.0;
+    let roll_lo = (fl_lo.metrics.roll_arm_compression_m.unwrap()
+        - fr_hi.metrics.roll_arm_compression_m.unwrap())
+        / 2.0;
+    let roll_ratio = (roll_hi - roll_lo) / (2.0 * h);
+    // Both interconnect springs have zero preload, and the design pose is exactly zero
+    // compression, so the preload-dependent geometric-stiffness term in wheel_rate
+    // (F_s * gradient) vanishes exactly here: wheel_rate reduces exactly to k*ratio^2,
+    // giving a tight independent oracle rather than a leading-order approximation.
+    let expected_heave = 40_000.0 * heave_ratio * heave_ratio;
+    let expected_roll = 20_000.0 * roll_ratio * roll_ratio;
+    let heave_rate = a.front.heave_wheel_rate_n_per_m.value.unwrap();
+    let roll_rate = a.front.roll_wheel_rate_n_per_m.value.unwrap();
+    assert!(
+        (heave_rate - expected_heave).abs() < 1.0,
+        "{heave_rate} {expected_heave}"
+    );
+    assert!(
+        (roll_rate - expected_roll).abs() < 1.0,
+        "{roll_rate} {expected_roll}"
+    );
+}

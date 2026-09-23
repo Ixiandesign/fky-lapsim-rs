@@ -351,6 +351,8 @@ fn synthetic_ride() -> dw_core::RideRun {
             compression_velocity_m_s: [0.; 4],
             shock_force_n: [0.; 4],
             support_reaction_n: [0.; 4],
+            front_interconnect: None,
+            rear_interconnect: None,
             energy_j: 0.,
             dissipated_work_j: 0.,
             support_work_j: 0.,
@@ -697,4 +699,82 @@ fn combined_case_and_aggregate_failure_checkpoint_round_trips() {
     resumed.advance(1, None).unwrap();
     assert!(resumed.is_finished());
     assert!(OptimizationSession::resume(&p, &r, &resumed.checkpoint().unwrap()).is_ok());
+}
+#[test]
+fn interconnect_parameter_registry_only_when_configured() {
+    let registry = parameter_registry(&Project::example());
+    assert!(!registry.iter().any(|s| s.starts_with("/front_interconnect")));
+    assert!(!registry.iter().any(|s| s.starts_with("/rear_interconnect")));
+    assert!(!registry.iter().any(|s| s.contains("rocker_heave_arm")));
+
+    let registry = parameter_registry(&Project::example_with_interconnect());
+    assert!(registry.contains(&"/front_interconnect/heave/spring_rate".to_string()));
+    assert!(registry.contains(&"/front_interconnect/roll/spring_rate".to_string()));
+    assert!(registry.contains(&"/front_interconnect/heave/preload".to_string()));
+    // example_with_interconnect() only configures front_interconnect.
+    assert!(!registry.iter().any(|s| s.starts_with("/rear_interconnect")));
+    // Every corner gets the hardpoints in this fixture, even ones without an active
+    // interconnect -- the per-corner registry entry follows the hardpoint, not the axle.
+    for i in 0..4 {
+        assert!(registry.contains(&format!("/corners/{i}/rocker_heave_arm/0")));
+    }
+}
+#[test]
+fn interconnect_metric_registry_includes_axle_wheel_rate_and_corner_compression() {
+    let registry = metric_registry();
+    assert!(registry.contains(&"vehicle.front.heave_wheel_rate_n_per_m".to_string()));
+    assert!(registry.contains(&"vehicle.rear.roll_wheel_rate_n_per_m".to_string()));
+    // Picked up automatically from crate::Metrics's serialized field names.
+    assert!(registry.contains(&"heave_arm_compression_m".to_string()));
+    assert!(registry.contains(&"roll_arm_compression_m".to_string()));
+}
+#[test]
+fn optimize_targets_interconnect_heave_wheel_rate() {
+    let p = Project::example_with_interconnect();
+    let known_rate = 55_000.0;
+    let mut known_project = p.clone();
+    known_project
+        .front_interconnect
+        .as_mut()
+        .unwrap()
+        .heave
+        .spring_rate = known_rate;
+    let known_metric = dw_core::analyze(&known_project, &dw_core::Motion::default())
+        .unwrap()
+        .front
+        .heave_wheel_rate_n_per_m
+        .value
+        .expect("front heave interconnect configured");
+    let r = OptimizationRequest {
+        variables: vec![Variable {
+            path: "/front_interconnect/heave/spring_rate".into(),
+            kind: VariableKind::Continuous {
+                lower: 10_000.,
+                upper: 80_000.,
+            },
+        }],
+        targets: vec![Target {
+            corner: None,
+            metric: "vehicle.front.heave_wheel_rate_n_per_m".into(),
+            value: known_metric,
+            values: None,
+            scale: known_metric.max(1.0),
+            weight: 1.,
+            aggregation: Aggregation::MeanSquared,
+        }],
+        scenarios: vec![dw_core::Motion::default()],
+        max_evaluations: 400,
+        generations: 30,
+        population_size: 10,
+        ..Default::default()
+    };
+    let a = optimize(&p, &r).unwrap();
+    let best = a
+        .best_feasible
+        .expect("optimizer should find a feasible candidate for a linear, reachable target");
+    assert!(
+        best.evaluation.score.unwrap() < 1e-4,
+        "{:?}",
+        best.evaluation.score
+    );
 }
