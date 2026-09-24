@@ -19,3 +19,8 @@ __pycache__/
 # in ref/text/ is tracked.
 ref/*.pdf
 ref/*.doc
+# Impeccable plugin's own local cache/scratch state, not project artifacts.
+.impeccable/hook.cache.json
+.impeccable/live/
+app/.impeccable/hook.cache.json
+app/.impeccable/live/
