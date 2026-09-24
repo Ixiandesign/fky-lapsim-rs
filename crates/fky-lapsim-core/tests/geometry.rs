@@ -1,4 +1,16 @@
 use dw_core::*;
+
+#[test]
+fn legacy_analysis_does_not_invent_a_caster_derivative() {
+    let analysis = dw_core::analysis::analyze(&Project::example(), &Motion::default()).unwrap();
+    let mut data = serde_json::to_value(analysis).unwrap();
+    for corner in data["corners"].as_array_mut().unwrap() {
+        corner.as_object_mut().unwrap().remove("caster_gain_deg_per_m");
+    }
+    let restored: dw_core::analysis::Analysis = serde_json::from_value(data).unwrap();
+    assert!(restored.corners[0].caster_gain_deg_per_m.value.is_none());
+    assert!(restored.corners[0].caster_gain_deg_per_m.reason.is_some());
+}
 fn configured(profile: &str) -> Corner {
     let mut c = serde_json::to_value(&Project::example().corners[0]).unwrap();
     c["tire_profile"] = profile.into();
@@ -263,6 +275,12 @@ fn skew_first_derivatives_match_independent_corner_samples() {
     assert!((ratio - a.corners[0].motion_ratio.value.unwrap()).abs() < 2e-5);
     assert!((camber - a.corners[0].camber_gain_deg_per_m.value.unwrap()).abs() < 0.002);
     assert!((toe - a.corners[0].toe_gain_deg_per_m.value.unwrap()).abs() < 0.002);
+    let caster = (hi.metrics.caster_deg - lo.metrics.caster_deg) / (2.0 * h);
+    let encoded = serde_json::to_value(&a).unwrap();
+    let reported = encoded["corners"][0]["caster_gain_deg_per_m"]["value"]
+        .as_f64()
+        .expect("caster derivative must be reported alongside camber/toe");
+    assert!((caster - reported).abs() < 0.002);
 }
 #[test]
 fn interconnect_wheel_rate_absent_without_configuration_present_when_configured() {

@@ -1,5 +1,6 @@
 //! Prescribed vehicle-level motion: commands chassis heave/roll/pitch/rack and solves
 //! all four corners together, on a flat or per-corner road.
+pub use crate::motion_grid::{motion_grid, AxisRange, GridMode, MotionGrid};
 use crate::{CornerState, Error, Project};
 use serde::{Deserialize, Serialize};
 /// Commanded chassis/rack motion for [simulate]/[simulate_on_road]/[sweep]. The finite
@@ -37,6 +38,43 @@ pub struct Sample {
     pub state: Option<VehicleState>,
     /// Failure message, or `None` if `state` is present.
     pub error: Option<String>,
+}
+
+/// A prescribed-motion sample with expanded geometry analysis. The nested
+/// analysis records derivative coordinates, steps, undefined values and reasons.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailedSample {
+    /// Existing sweep shape, flattened for backward-compatible consumers.
+    #[serde(flatten)]
+    pub sample: Sample,
+    /// Expanded analysis, absent when the requested pose fails.
+    pub analysis: Option<crate::Analysis>,
+}
+
+/// Analyze every requested motion without discarding failed states. Use [sweep]
+/// when only basic geometry is needed; derivatives add closure evaluations.
+pub fn detailed_sweep(p: &Project, motions: &[Motion]) -> Vec<DetailedSample> {
+    motions
+        .iter()
+        .map(|m| match crate::analyze(p, m) {
+            Ok(analysis) => DetailedSample {
+                sample: Sample {
+                    motion: *m,
+                    state: Some(analysis.state.clone()),
+                    error: None,
+                },
+                analysis: Some(analysis),
+            },
+            Err(e) => DetailedSample {
+                sample: Sample {
+                    motion: *m,
+                    state: None,
+                    error: Some(e.to_string()),
+                },
+                analysis: None,
+            },
+        })
+        .collect()
 }
 /// Solve all four corners for `m` on a flat (zero-height) road. Equivalent to
 /// `simulate_on_road(p, m, [0.0; 4])`.

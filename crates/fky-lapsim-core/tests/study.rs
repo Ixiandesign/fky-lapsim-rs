@@ -48,6 +48,29 @@ fn rest_recovery_and_failed_samples() {
     assert!(samples[1].error.is_some());
     assert!(samples[2].state.is_some());
 }
+
+#[test]
+fn detailed_sweep_retains_derivatives_and_failed_rows() {
+    let rows = dw_core::study::detailed_sweep(
+        &Project::example(),
+        &[
+            Motion::default(),
+            Motion {
+                heave: 1.,
+                ..Default::default()
+            },
+        ],
+    );
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].analysis.as_ref().unwrap().corners[0]
+        .caster_gain_deg_per_m
+        .value
+        .is_some());
+    assert!(rows[0].sample.state.is_some());
+    assert!(rows[1].analysis.is_none());
+    assert!(rows[1].sample.state.is_none());
+    assert!(rows[1].sample.error.is_some());
+}
 #[test]
 fn finite_roll_pitch_contact_and_chassis_transform() {
     let p = Project::example();

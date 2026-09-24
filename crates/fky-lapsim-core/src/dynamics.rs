@@ -7,6 +7,8 @@
 use crate::{AxleInterconnect, Chassis, SpringDamper};
 use crate::{CornerId, Error, Project};
 use serde::{Deserialize, Serialize};
+mod linearization;
+pub use linearization::{linearize_ride, RideLinearization, RideModeShape};
 
 /// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::Reduced].
 pub const MODEL_FIDELITY: &str = "nonlinear_sprung_body_fixed_contact_massless_links";
@@ -1105,15 +1107,20 @@ fn static_stiffness(
     r: &RideRequest,
     q: [f64; 3],
 ) -> Result<nalgebra::Matrix3<f64>, Error> {
+    static_stiffness_step(p, r, q, 0.0002)
+}
+fn static_stiffness_step(
+    p: &Project, r: &RideRequest, q: [f64; 3], step: f64,
+) -> Result<nalgebra::Matrix3<f64>, Error> {
     let mut h = nalgebra::Matrix3::zeros();
     for a in 0..3 {
         let mut qp = q;
         let mut qm = q;
-        qp[a] += 0.0002;
-        qm[a] -= 0.0002;
+        qp[a] += step;
+        qm[a] -= step;
         h.set_column(
             a,
-            &((static_residual(p, r, qp)? - static_residual(p, r, qm)?) / 0.0004),
+            &((static_residual(p, r, qp)? - static_residual(p, r, qm)?) / (2. * step)),
         );
     }
     Ok((h + h.transpose()) / 2.)

@@ -61,6 +61,9 @@ pub struct CornerAnalysis {
     pub camber_gain_deg_per_m: OptionalValue<f64>,
     /// Toe gain, degrees per metre of upward wheel-center motion.
     pub toe_gain_deg_per_m: OptionalValue<f64>,
+    /// Caster gain, degrees per metre of upward wheel-center motion.
+    #[serde(default = "unrecorded_caster_gain")]
+    pub caster_gain_deg_per_m: OptionalValue<f64>,
     /// Projected front-view instantaneous center for this corner.
     pub projected_front_view_ic: ProjectedCenter,
     /// Set when this corner's tire support point is not a unique/smooth function of
@@ -72,6 +75,9 @@ pub struct CornerAnalysis {
     /// Mechanical trail, metres; undefined under the same conditions as
     /// [crate::Metrics::mechanical_trail_m].
     pub mechanical_trail_m: OptionalValue<f64>,
+}
+fn unrecorded_caster_gain() -> OptionalValue<f64> {
+    OptionalValue::absent("not recorded in legacy analysis")
 }
 /// One axle's track and geometric roll center, from [analyze]/[analyze_with_step].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +261,7 @@ pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Er
             spring_wheel_rate_n_per_m: OptionalValue::absent("perturbation failed"),
             camber_gain_deg_per_m: OptionalValue::absent("perturbation failed"),
             toe_gain_deg_per_m: OptionalValue::absent("perturbation failed"),
+            caster_gain_deg_per_m: OptionalValue::absent("perturbation failed"),
             projected_front_view_ic: ProjectedCenter {
                 point_yz_m: None,
                 direction_yz: None,
@@ -300,6 +307,10 @@ pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Er
                 let delta =
                     (hi.metrics.toe_deg - lo.metrics.toe_deg + 180.0).rem_euclid(360.0) - 180.0;
                 out.toe_gain_deg_per_m = OptionalValue::known(delta / (2.0 * h));
+                let caster_delta = (hi.metrics.caster_deg - lo.metrics.caster_deg + 180.0)
+                    .rem_euclid(360.0)
+                    - 180.0;
+                out.caster_gain_deg_per_m = OptionalValue::known(caster_delta / (2.0 * h));
                 let spring = &c.spring_damper;
                 let tangent = if let Some(curve) = &spring.spring_curve {
                     if curve.iter().any(|point| (point[0] - b).abs() < 1e-10) {
@@ -347,6 +358,7 @@ pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Er
                 out.spring_wheel_rate_n_per_m.reason = Some(reason.clone());
                 out.camber_gain_deg_per_m.reason = Some(reason.clone());
                 out.toe_gain_deg_per_m.reason = Some(reason.clone());
+                out.caster_gain_deg_per_m.reason = Some(reason.clone());
                 out.projected_front_view_ic.reason = Some(reason);
             }
         }

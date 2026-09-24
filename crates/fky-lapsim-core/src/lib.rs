@@ -5,6 +5,10 @@ pub mod dynamics;
 pub mod kinematics;
 pub mod metrics;
 pub mod model;
+mod motion_grid;
+pub mod results;
+pub mod tire;
+pub mod planar;
 pub mod study;
 pub use dynamics::{
     ride, InterconnectSample, RideMode, RideRequest, RideRun, RideSample, RideTermination,

@@ -18,6 +18,16 @@ fn native_error(e: impl std::fmt::Display) -> String {
 fn run(op: &str, input: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(input).map_err(native_error)?;
     match op {
+        "motion_grid" => {
+            return encoded(
+                dw_core::study::motion_grid(&parse(&v["request"])?).map_err(native_error)?,
+            )
+        }
+        "result_table" => {
+            let kind = v["kind"].as_str().ok_or("result kind must be a string")?;
+            let table = dw_core::results::result_table(kind, &v["result"]).map_err(native_error)?;
+            return encoded(json!({"table": table, "csv": table.csv()}));
+        }
         "example_project" => return encoded(Project::example()),
         "formula_car_demo" => {
             let (project, request) = dw_core::dynamics::formula_car_demo().map_err(native_error)?;
@@ -65,8 +75,12 @@ fn run(op: &str, input: &str) -> Result<String, String> {
             )
             .map_err(native_error)?,
         ),
-        "sweep" => encoded(dw_core::sweep(&p, &parse::<Vec<Motion>>(&v["motions"])?)),
+        "sweep" => encoded(dw_core::study::detailed_sweep(
+            &p,
+            &parse::<Vec<Motion>>(&v["motions"])?,
+        )),
         "ride" => encoded(dw_core::ride(&p, &parse(&v["request"])?).map_err(native_error)?),
+        "linearize_ride" => encoded(dw_core::dynamics::linearize_ride(&p, &parse(&v["request"])?).map_err(native_error)?),
         "parameter_registry" => encoded(opt::parameter_registry(&p)),
         "optimize" => encoded(opt::optimize(&p, &parse(&v["request"])?).map_err(native_error)?),
         "candidate_project" => encoded(

@@ -445,6 +445,7 @@ pub fn metric_registry() -> Vec<String> {
             "analysis.spring_wheel_rate_n_per_m",
             "analysis.camber_gain_deg_per_m",
             "analysis.toe_gain_deg_per_m",
+            "analysis.caster_gain_deg_per_m",
             "vehicle.left_wheelbase_m",
             "vehicle.right_wheelbase_m",
             "vehicle.left_contact_wheelbase_m",
