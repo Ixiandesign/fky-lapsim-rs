@@ -39,6 +39,34 @@ fn run(op: &str, input: &str) -> Result<String, String> {
             )
         }
         "metric_registry" => return encoded(opt::metric_registry()),
+        "lap_vehicle_demo" => return encoded(dw_core::lap::LapVehicle::synthetic_demo().map_err(native_error)?),
+        "validate_lap_vehicle" => {
+            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            vehicle.validate().map_err(native_error)?;
+            return encoded(json!({"valid": true}));
+        }
+        "validate_track" => {
+            let track: dw_core::track::Track = parse(&v["track"])?;
+            track.validate().map_err(native_error)?;
+            return encoded(json!({"valid": true}));
+        }
+        "validate_lap_request" => {
+            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            let track: dw_core::track::Track = parse(&v["track"])?;
+            let request: dw_core::lap::LapRequest = parse(&v["request"])?;
+            vehicle.validate().map_err(native_error)?;
+            track.validate().map_err(native_error)?;
+            request.validate().map_err(native_error)?;
+            return encoded(request);
+        }
+        "run_lap" => {
+            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            let track: dw_core::track::Track = parse(&v["track"])?;
+            let request: dw_core::lap::LapRequest = parse(&v["request"])?;
+            return encoded(
+                dw_core::lap::simulate_lap(&vehicle, &track, &request).map_err(native_error)?,
+            );
+        }
         _ => {}
     }
     let p: Project = parse(&v["project"])?;
