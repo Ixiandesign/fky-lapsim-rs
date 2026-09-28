@@ -8,7 +8,12 @@ pub mod model;
 mod motion_grid;
 pub mod results;
 pub mod tire;
+pub mod tire_configuration;
 pub mod planar;
+pub mod powertrain;
+pub mod aero;
+pub mod track;
+pub mod lap;
 pub mod study;
 pub use dynamics::{
     ride, InterconnectSample, RideMode, RideRequest, RideRun, RideSample, RideTermination,

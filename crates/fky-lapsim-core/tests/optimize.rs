@@ -343,6 +343,7 @@ fn synthetic_ride() -> dw_core::RideRun {
     let samples = [0., 0.25, 1.]
         .into_iter()
         .map(|t| dw_core::RideSample {
+            state: None,
             time_s: t,
             displacement: [-2. * t, 3. * t, -4. * t],
             velocity: [0.; 3],

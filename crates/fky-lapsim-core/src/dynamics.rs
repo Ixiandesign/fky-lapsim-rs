@@ -89,6 +89,13 @@ pub struct RideRequest {
     pub initial_velocity: [f64; 3],
     /// Generalized heave force / roll and pitch moments, conjugate to q.
     pub external_force: [f64; 3],
+    /// Optional piecewise-linear `[time_s, heave_N, roll_Nm, pitch_Nm]` history.
+    /// Replaces `external_force`; at least two finite, strictly increasing rows
+    /// must cover `[0, duration_s]`. Equilibrium uses its value at time zero.
+    pub external_force_history: Option<Vec<[f64; 4]>>,
+    /// Include solved suspension geometry in accepted samples. Defaults to false;
+    /// does not request the additional full-vehicle derivative analysis.
+    pub report_states: bool,
     /// Solve with the road frozen at t=0 before applying initial offsets.
     pub solve_equilibrium: bool,
     /// Prescribed road input for the run; see [RoadInput].
@@ -106,6 +113,8 @@ impl Default for RideRequest {
             initial_displacement: [0.; 3],
             initial_velocity: [0.; 3],
             external_force: [0.; 3],
+            external_force_history: None,
+            report_states: false,
             solve_equilibrium: true,
             road: RoadInput::Flat,
         }
@@ -134,6 +143,9 @@ pub struct InterconnectSample {
 /// One accepted integration sample of a [RideRun].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideSample {
+    /// Solved geometry at this sample's motion, rack travel and prescribed road.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::VehicleState>,
     /// Simulation time, seconds, since the start of the run.
     pub time_s: f64,
     /// Generalized chassis state `[heave m, roll rad, pitch rad]`.
@@ -232,7 +244,7 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
         y[a + 3] = r.initial_velocity[a];
     }
     let mut t = 0.;
-    let first = match evaluate(p, r, t, y, false) {
+    let first = match evaluate_reported(p, r, t, y) {
         Ok(s) => s,
         Err(e) => {
             run.termination = Some(event(p, 0., None, e));
@@ -245,7 +257,12 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
         if run.samples.len() >= MAX_SAMPLES {
             return Err(error("ride sample/work limit exceeded"));
         }
-        let end = next_knot(&r.road, t, r.duration_s.min(t + r.dt_s));
+        let mut end = next_knot(&r.road, t, r.duration_s.min(t + r.dt_s));
+        if let Some(history) = &r.external_force_history {
+            if let Some(row) = history.get(history.partition_point(|row| row[0] <= t)) {
+                end = end.min(row[0]);
+            }
+        }
         let mut dt = end - t;
         loop {
             let next = t + dt;
@@ -262,7 +279,8 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
                     .sum::<f64>()
                     + interconnect_dissipated_power(p, &s);
                 let support = (0..4).map(|i| s.support_reaction_n[i] * zd[i]).sum();
-                let ext = (0..3).map(|a| r.external_force[a] * state[a + 3]).sum();
+                let force = external_force_at(r, time);
+                let ext = (0..3).map(|a| force[a] * state[a + 3]).sum();
                 Ok([
                     state[3],
                     state[4],
@@ -277,7 +295,7 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
             })
             .and_then(|state| {
                 failed_time = next;
-                evaluate(p, r, next, state, false).map(|s| (state, s))
+                evaluate_reported(p, r, next, state).map(|s| (state, s))
             });
             match integrated {
                 Ok((state, mut sample)) => {
@@ -299,6 +317,59 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
         }
     }
     Ok(run)
+}
+/// Evaluate instantaneous ride acceleration and support loads at an absolute
+/// generalized state. Does not solve equilibrium or apply initial offsets.
+/// Time must lie in `[0, duration_s]`; contact/geometry failures return `Err`.
+/// Work integrals and the energy-balance residual are zero (no integration).
+/// Geometry is included when `report_states` is true.
+pub fn evaluate_ride(
+    p: &Project,
+    r: &RideRequest,
+    time_s: f64,
+    displacement: [f64; 3],
+    velocity: [f64; 3],
+) -> Result<RideSample, Error> {
+    p.validate()?;
+    validate_request(r)?;
+    if !time_s.is_finite()
+        || time_s < 0.
+        || time_s > r.duration_s
+        || !displacement
+            .iter()
+            .chain(velocity.iter())
+            .all(|x| x.is_finite())
+    {
+        return Err(error(
+            "instantaneous ride time/state must be finite and time within the run",
+        ));
+    }
+    let mut y = [0.; 9];
+    y[..3].copy_from_slice(&displacement);
+    y[3..6].copy_from_slice(&velocity);
+    evaluate_reported(p, r, time_s, y)
+}
+fn evaluate_reported(
+    p: &Project,
+    r: &RideRequest,
+    t: f64,
+    y: [f64; 9],
+) -> Result<RideSample, Error> {
+    let mut sample = evaluate(p, r, t, y, false)?;
+    if r.report_states {
+        sample.state = Some(crate::simulate_on_road(
+            p,
+            &crate::Motion {
+                heave: y[0],
+                roll: y[1],
+                pitch: y[2],
+                rack_front: r.rack_front,
+                rack_rear: r.rack_rear,
+            },
+            road_at(p, &r.road, t, false).0,
+        )?);
+    }
+    Ok(sample)
 }
 /// Illustrative 300 kg formula-car-scale sprung mass, not a validated race-car model.
 /// Equal preload is derived from the actual symmetric rest-pose compression Jacobian.
@@ -370,6 +441,22 @@ pub fn validate_request(r: &RideRequest) -> Result<(), Error> {
             "invalid finite ride duration, timestep, state, force or sample limit",
         ));
     }
+    if let Some(history) = &r.external_force_history {
+        if history.len() < 2
+            || history.len() > MAX_SAMPLES
+            || !history.iter().flatten().all(|x| x.is_finite())
+            || history[0][0] > 0.
+            || history.last().unwrap()[0] < r.duration_s
+            || !history.windows(2).all(|w| {
+                let dt = w[1][0] - w[0][0];
+                dt > 0. && dt.is_finite() && (1..4).all(|i| ((w[1][i] - w[0][i]) / dt).is_finite())
+            })
+        {
+            return Err(error(
+                "invalid external force history: finite increasing rows must cover the run",
+            ));
+        }
+    }
     let valid = match &r.road {
         RoadInput::Flat => true,
         RoadInput::Sine {
@@ -412,15 +499,25 @@ pub fn validate_request(r: &RideRequest) -> Result<(), Error> {
             "invalid road input or noncontinuous/unsorted history",
         ));
     }
-    if let RoadInput::Histories { corners } = &r.road {
+    {
         let mut knots = vec![0., r.duration_s];
-        knots.extend(
-            corners
-                .iter()
-                .flatten()
-                .map(|p| p[0])
-                .filter(|t| *t > 0. && *t < r.duration_s),
-        );
+        if let RoadInput::Histories { corners } = &r.road {
+            knots.extend(
+                corners
+                    .iter()
+                    .flatten()
+                    .map(|p| p[0])
+                    .filter(|t| *t > 0. && *t < r.duration_s),
+            );
+        }
+        if let Some(history) = &r.external_force_history {
+            knots.extend(
+                history
+                    .iter()
+                    .map(|row| row[0])
+                    .filter(|t| *t > 0. && *t < r.duration_s),
+            );
+        }
         knots.sort_by(f64::total_cmp);
         knots.dedup();
         let steps = knots
@@ -429,11 +526,24 @@ pub fn validate_request(r: &RideRequest) -> Result<(), Error> {
             .sum::<f64>();
         if steps > (MAX_SAMPLES - 1) as f64 {
             return Err(error(
-                "combined road history knots exceed ride sample/work limit",
+                "combined road/load history knots exceed ride sample/work limit",
             ));
         }
     }
     Ok(())
+}
+fn external_force_at(r: &RideRequest, t: f64) -> [f64; 3] {
+    let Some(history) = &r.external_force_history else {
+        return r.external_force;
+    };
+    let k = history
+        .partition_point(|row| row[0] <= t)
+        .saturating_sub(1)
+        .min(history.len() - 2);
+    let a = history[k];
+    let b = history[k + 1];
+    let fraction = (t - a[0]) / (b[0] - a[0]);
+    std::array::from_fn(|i| a[i + 1] + fraction * (b[i + 1] - a[i + 1]))
 }
 fn next_knot(road: &RoadInput, t: f64, end: f64) -> f64 {
     match road {
@@ -512,7 +622,9 @@ fn compression(
     .corners;
     Ok((
         corners.each_ref().map(|c| c.metrics.shock_compression_m),
-        corners.each_ref().map(|c| c.metrics.heave_arm_compression_m),
+        corners
+            .each_ref()
+            .map(|c| c.metrics.heave_arm_compression_m),
         corners.each_ref().map(|c| c.metrics.roll_arm_compression_m),
     ))
 }
@@ -740,7 +852,7 @@ fn evaluate(
     let mut u = [0.; 4];
     let mut force = [0.; 4];
     let mut support = [0.; 4];
-    let mut generalized = r.external_force;
+    let mut generalized = external_force_at(r, t);
     generalized[0] -= p.chassis.sprung_mass * GRAVITY;
     let mut energy =
         chassis_kinetic_energy(&p.chassis, q, v) + p.chassis.sprung_mass * GRAVITY * q[0];
@@ -811,6 +923,7 @@ fn evaluate(
         return Err(error("nonfinite dynamics force or energy"));
     }
     Ok(RideSample {
+        state: None,
         time_s: t,
         displacement: q,
         velocity: v,
@@ -896,14 +1009,18 @@ fn evaluate_components(
     // recomputing per refinement level could only introduce spurious variation. Both stay
     // `None`, and the correction/energy totals below stay all-zero, for a project with
     // neither axle interconnect configured, so `compute`'s existing arithmetic is unaffected.
-    let front_dynamics = p
-        .front_interconnect
-        .as_ref()
-        .map(|ai| (ai, interconnect_dynamics(p, &cm, ai, CornerId::FrontLeft, CornerId::FrontRight, v, zd)));
-    let rear_dynamics = p
-        .rear_interconnect
-        .as_ref()
-        .map(|ai| (ai, interconnect_dynamics(p, &cm, ai, CornerId::RearLeft, CornerId::RearRight, v, zd)));
+    let front_dynamics = p.front_interconnect.as_ref().map(|ai| {
+        (
+            ai,
+            interconnect_dynamics(p, &cm, ai, CornerId::FrontLeft, CornerId::FrontRight, v, zd),
+        )
+    });
+    let rear_dynamics = p.rear_interconnect.as_ref().map(|ai| {
+        (
+            ai,
+            interconnect_dynamics(p, &cm, ai, CornerId::RearLeft, CornerId::RearRight, v, zd),
+        )
+    });
     let all_dynamics = [&front_dynamics, &rear_dynamics];
     let interconnect_generalized: [f64; 3] = std::array::from_fn(|k| {
         all_dynamics
@@ -934,7 +1051,7 @@ fn evaluate_components(
         terms.gravity[0] += ch.sprung_mass * GRAVITY;
         terms.bias[1] -= 0.5 * ap * v[2] * v[2];
         terms.bias[2] += ap * v[1] * v[2];
-        let mut rhs = nalgebra::Vector3::from(r.external_force);
+        let mut rhs = nalgebra::Vector3::from(external_force_at(r, t));
         for k in 0..3 {
             rhs[k] -= terms.gravity[k]
                 + terms.bias[k]
@@ -1020,6 +1137,7 @@ fn evaluate_components(
         return Err(error("nonfinite component acceleration/support/energy"));
     }
     Ok(RideSample {
+        state: None,
         time_s: t,
         displacement: q,
         velocity: v,
@@ -1066,10 +1184,11 @@ fn static_residual(
     } else {
         crate::mass::X::zeros()
     };
+    let force = external_force_at(r, 0.);
     let mut residual = nalgebra::Vector3::new(
-        p.chassis.sprung_mass * GRAVITY - r.external_force[0],
-        -r.external_force[1],
-        -r.external_force[2],
+        p.chassis.sprung_mass * GRAVITY - force[0],
+        -force[1],
+        -force[2],
     );
     for a in 0..3 {
         residual[a] += component_gravity[a];
@@ -1110,7 +1229,10 @@ fn static_stiffness(
     static_stiffness_step(p, r, q, 0.0002)
 }
 fn static_stiffness_step(
-    p: &Project, r: &RideRequest, q: [f64; 3], step: f64,
+    p: &Project,
+    r: &RideRequest,
+    q: [f64; 3],
+    step: f64,
 ) -> Result<nalgebra::Matrix3<f64>, Error> {
     let mut h = nalgebra::Matrix3::zeros();
     for a in 0..3 {
