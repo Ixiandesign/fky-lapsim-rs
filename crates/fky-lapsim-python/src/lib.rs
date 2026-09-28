@@ -40,6 +40,7 @@ fn run(op: &str, input: &str) -> Result<String, String> {
         }
         "metric_registry" => return encoded(opt::metric_registry()),
         "lap_vehicle_demo" => return encoded(dw_core::lap::LapVehicle::synthetic_demo().map_err(native_error)?),
+        "track_demo" => return encoded(dw_core::track::Track::oval(60., 9., 8., 24).map_err(native_error)?),
         "validate_lap_vehicle" => {
             let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
             vehicle.validate().map_err(native_error)?;
