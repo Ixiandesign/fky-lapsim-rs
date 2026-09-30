@@ -1,4 +1,4 @@
-use dw_core::dynamics::*;
+use fky_lapsim_core::dynamics::*;
 
 #[test]
 fn legacy_request_defaults_and_combined_knot_work_limit() {
@@ -23,7 +23,7 @@ fn legacy_request_defaults_and_combined_knot_work_limit() {
 fn retained_component_acceleration_and_reaction_use_instantaneous_load() {
     let (mut p, mut r) = formula_car_demo().unwrap();
     for c in &mut p.corners {
-        c.component_masses.knuckle = Some(dw_core::BodyMass {
+        c.component_masses.knuckle = Some(fky_lapsim_core::BodyMass {
             mass_kg: 8.,
             center_of_mass: c.wheel_center,
             inertia: [[0.1, 0., 0.], [0., 0.1, 0.], [0., 0., 0.1]],
@@ -91,9 +91,9 @@ fn reported_geometry_matches_instantaneous_motion_road_and_racks() {
     let run = ride(&p, &r).unwrap();
     let s = &run.samples[0];
     let state = s.state.as_ref().unwrap();
-    let expected = dw_core::simulate_on_road(
+    let expected = fky_lapsim_core::simulate_on_road(
         &p,
-        &dw_core::Motion {
+        &fky_lapsim_core::Motion {
             heave: s.displacement[0],
             roll: s.displacement[1],
             pitch: s.displacement[2],

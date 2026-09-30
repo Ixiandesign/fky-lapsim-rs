@@ -1,4 +1,4 @@
-use dw_core::{lap::optimization as lap_opt, optimize as opt, Motion, Project, RideRequest};
+use fky_lapsim_core::{lap::optimization as lap_opt, optimize as opt, Motion, Project, RideRequest};
 use pyo3::{exceptions::PyValueError, prelude::*};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -29,7 +29,7 @@ fn set_numeric_path(root: &mut Value, path: &str, value: f64) -> Result<(), Stri
 }
 /// Add to a numeric field addressed by JSON Pointer `path`, in place — the
 /// optimizer's uncertainty deltas are additive perturbations, applied after
-/// a candidate's variables are already set (matching dw_core::optimize's
+/// a candidate's variables are already set (matching fky_lapsim_core::optimize's
 /// Perturbation semantics).
 fn add_numeric_path(root: &mut Value, path: &str, delta: f64) -> Result<(), String> {
     let slot = root
@@ -43,13 +43,13 @@ fn add_numeric_path(root: &mut Value, path: &str, delta: f64) -> Result<(), Stri
 }
 /// Parse the `{"<track_id>": {"track": Track, "settings": LapRequest}}` map
 /// a lap-optimization request's evaluator resolves `TrackCase.id`s against.
-fn lap_opt_tracks(v: &Value) -> Result<BTreeMap<String, (dw_core::track::Track, dw_core::lap::LapRequest)>, String> {
+fn lap_opt_tracks(v: &Value) -> Result<BTreeMap<String, (fky_lapsim_core::track::Track, fky_lapsim_core::lap::LapRequest)>, String> {
     let map: BTreeMap<String, Value> = parse(v)?;
     map.into_iter()
         .map(|(id, entry)| {
-            let track: dw_core::track::Track = parse(&entry["track"])?;
+            let track: fky_lapsim_core::track::Track = parse(&entry["track"])?;
             track.validate()?;
-            let settings: dw_core::lap::LapRequest = parse(&entry["settings"])?;
+            let settings: fky_lapsim_core::lap::LapRequest = parse(&entry["settings"])?;
             settings.validate().map_err(native_error)?;
             Ok((id, (track, settings)))
         })
@@ -60,17 +60,17 @@ fn run(op: &str, input: &str) -> Result<String, String> {
     match op {
         "motion_grid" => {
             return encoded(
-                dw_core::study::motion_grid(&parse(&v["request"])?).map_err(native_error)?,
+                fky_lapsim_core::study::motion_grid(&parse(&v["request"])?).map_err(native_error)?,
             )
         }
         "result_table" => {
             let kind = v["kind"].as_str().ok_or("result kind must be a string")?;
-            let table = dw_core::results::result_table(kind, &v["result"]).map_err(native_error)?;
+            let table = fky_lapsim_core::results::result_table(kind, &v["result"]).map_err(native_error)?;
             return encoded(json!({"table": table, "csv": table.csv()}));
         }
         "example_project" => return encoded(Project::example()),
         "formula_car_demo" => {
-            let (project, request) = dw_core::dynamics::formula_car_demo().map_err(native_error)?;
+            let (project, request) = fky_lapsim_core::dynamics::formula_car_demo().map_err(native_error)?;
             return encoded(json!({"project":project,"request":request}));
         }
         "defaults" => {
@@ -79,7 +79,7 @@ fn run(op: &str, input: &str) -> Result<String, String> {
             )
         }
         "metric_registry" => return encoded(opt::metric_registry()),
-        "lap_vehicle_demo" => return encoded(dw_core::lap::LapVehicle::synthetic_demo().map_err(native_error)?),
+        "lap_vehicle_demo" => return encoded(fky_lapsim_core::lap::LapVehicle::synthetic_demo().map_err(native_error)?),
         "track_demo" => {
             let shape = v["shape"].as_str().unwrap_or("oval");
             let radius_m = v["radius_m"].as_f64().unwrap_or(9.);
@@ -87,42 +87,42 @@ fn run(op: &str, input: &str) -> Result<String, String> {
             let width_m = v["width_m"].as_f64().unwrap_or(8.);
             let segments = v["segments"].as_u64().unwrap_or(24) as usize;
             let track = match shape {
-                "circle" => dw_core::track::Track::circle(radius_m, width_m, segments),
-                _ => dw_core::track::Track::oval(straight_m, radius_m, width_m, segments),
+                "circle" => fky_lapsim_core::track::Track::circle(radius_m, width_m, segments),
+                _ => fky_lapsim_core::track::Track::oval(straight_m, radius_m, width_m, segments),
             }
             .map_err(native_error)?;
             return encoded(track);
         }
         "validate_lap_vehicle" => {
-            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            let vehicle: fky_lapsim_core::lap::LapVehicle = parse(&v["vehicle"])?;
             vehicle.validate().map_err(native_error)?;
             return encoded(json!({"valid": true}));
         }
         "validate_track" => {
-            let track: dw_core::track::Track = parse(&v["track"])?;
+            let track: fky_lapsim_core::track::Track = parse(&v["track"])?;
             track.validate().map_err(native_error)?;
             return encoded(json!({"valid": true}));
         }
         "validate_lap_request" => {
-            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
-            let track: dw_core::track::Track = parse(&v["track"])?;
-            let request: dw_core::lap::LapRequest = parse(&v["request"])?;
+            let vehicle: fky_lapsim_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            let track: fky_lapsim_core::track::Track = parse(&v["track"])?;
+            let request: fky_lapsim_core::lap::LapRequest = parse(&v["request"])?;
             vehicle.validate().map_err(native_error)?;
             track.validate().map_err(native_error)?;
             request.validate().map_err(native_error)?;
             return encoded(request);
         }
         "run_lap" => {
-            let vehicle: dw_core::lap::LapVehicle = parse(&v["vehicle"])?;
-            let track: dw_core::track::Track = parse(&v["track"])?;
-            let request: dw_core::lap::LapRequest = parse(&v["request"])?;
+            let vehicle: fky_lapsim_core::lap::LapVehicle = parse(&v["vehicle"])?;
+            let track: fky_lapsim_core::track::Track = parse(&v["track"])?;
+            let request: fky_lapsim_core::lap::LapRequest = parse(&v["request"])?;
             return encoded(
-                dw_core::lap::simulate_lap(&vehicle, &track, &request).map_err(native_error)?,
+                fky_lapsim_core::lap::simulate_lap(&vehicle, &track, &request).map_err(native_error)?,
             );
         }
         "validate_lap_optimization_request" => {
             let vehicle_json = v["vehicle"].clone();
-            let vehicle: dw_core::lap::LapVehicle = parse(&vehicle_json)?;
+            let vehicle: fky_lapsim_core::lap::LapVehicle = parse(&vehicle_json)?;
             vehicle.validate().map_err(native_error)?;
             let tracks = lap_opt_tracks(&v["tracks"])?;
             let request: lap_opt::OptimizationRequest = parse(&v["request"])?;
@@ -145,7 +145,7 @@ fn run(op: &str, input: &str) -> Result<String, String> {
         }
         "run_lap_optimization" => {
             let vehicle_json = v["vehicle"].clone();
-            let base_vehicle: dw_core::lap::LapVehicle = parse(&vehicle_json)?;
+            let base_vehicle: fky_lapsim_core::lap::LapVehicle = parse(&vehicle_json)?;
             base_vehicle.validate().map_err(native_error)?;
             let tracks = lap_opt_tracks(&v["tracks"])?;
             let request: lap_opt::OptimizationRequest = parse(&v["request"])?;
@@ -160,11 +160,11 @@ fn run(op: &str, input: &str) -> Result<String, String> {
                 for (path, delta) in &sample.deltas {
                     add_numeric_path(&mut candidate, path, *delta)?;
                 }
-                let vehicle: dw_core::lap::LapVehicle = parse(&candidate)?;
+                let vehicle: fky_lapsim_core::lap::LapVehicle = parse(&candidate)?;
                 let (track_json, settings) = tracks
                     .get(&track.id)
                     .ok_or_else(|| format!("no track supplied for id {}", track.id))?;
-                let run = dw_core::lap::simulate_lap(&vehicle, track_json, settings)
+                let run = fky_lapsim_core::lap::simulate_lap(&vehicle, track_json, settings)
                     .map_err(native_error)?;
                 Ok(run.metrics)
             };
@@ -180,13 +180,13 @@ fn run(op: &str, input: &str) -> Result<String, String> {
         "validate" => encoded(json!({"valid":true})),
         "validate_ride_request" => {
             let r: RideRequest = parse(&v["request"])?;
-            dw_core::dynamics::validate_request(&r).map_err(native_error)?;
+            fky_lapsim_core::dynamics::validate_request(&r).map_err(native_error)?;
             encoded(r)
         }
         "validate_optimization_request" => {
             let r: opt::OptimizationRequest = parse(&v["request"])?;
             if let Some(ride) = &r.ride_request {
-                dw_core::dynamics::validate_request(ride).map_err(native_error)?;
+                fky_lapsim_core::dynamics::validate_request(ride).map_err(native_error)?;
             }
             opt::OptimizationSession::start(&p, &r).map_err(native_error)?;
             encoded(r)
@@ -199,21 +199,21 @@ fn run(op: &str, input: &str) -> Result<String, String> {
             encoded(motions)
         }
         "normalize_project" => encoded(p),
-        "simulate" => encoded(dw_core::simulate(&p, &parse(&v["motion"])?).map_err(native_error)?),
+        "simulate" => encoded(fky_lapsim_core::simulate(&p, &parse(&v["motion"])?).map_err(native_error)?),
         "analyze" => encoded(
-            dw_core::analyze_with_step(
+            fky_lapsim_core::analyze_with_step(
                 &p,
                 &parse(&v["motion"])?,
                 v["step"].as_f64().unwrap_or(0.0002),
             )
             .map_err(native_error)?,
         ),
-        "sweep" => encoded(dw_core::study::detailed_sweep(
+        "sweep" => encoded(fky_lapsim_core::study::detailed_sweep(
             &p,
             &parse::<Vec<Motion>>(&v["motions"])?,
         )),
-        "ride" => encoded(dw_core::ride(&p, &parse(&v["request"])?).map_err(native_error)?),
-        "linearize_ride" => encoded(dw_core::dynamics::linearize_ride(&p, &parse(&v["request"])?).map_err(native_error)?),
+        "ride" => encoded(fky_lapsim_core::ride(&p, &parse(&v["request"])?).map_err(native_error)?),
+        "linearize_ride" => encoded(fky_lapsim_core::dynamics::linearize_ride(&p, &parse(&v["request"])?).map_err(native_error)?),
         "parameter_registry" => encoded(opt::parameter_registry(&p)),
         "optimize" => encoded(opt::optimize(&p, &parse(&v["request"])?).map_err(native_error)?),
         "candidate_project" => encoded(

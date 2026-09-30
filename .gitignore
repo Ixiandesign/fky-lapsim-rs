@@ -8,7 +8,7 @@ __pycache__/
 *.pdb
 .pytest_cache/
 /target/wheels/
-/python/dwsuspension/static/
+/python/fky_lapsim/static/
 /dist/
 /build/
 /packaging/*.venv/

@@ -1,4 +1,4 @@
-use dw_core::lap::{angular_acceleration, angular_energy};
+use fky_lapsim_core::lap::{angular_acceleration, angular_energy};
 
 #[test]
 fn euler_inertia_reduces_to_principal_axes_and_conserves_energy() {

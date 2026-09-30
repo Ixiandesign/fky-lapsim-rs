@@ -1,4 +1,4 @@
-use dw_core::{
+use fky_lapsim_core::{
     dynamics::{formula_car_demo, linearize_ride},
     RideMode,
 };
@@ -25,9 +25,9 @@ fn ride_modes_match_generalized_eigenproblem_and_static_weight() {
     // An independently evaluated spring-energy second difference checks the
     // reported heave stiffness, including geometric/preload effects.
     let energy = |h: f64| {
-        let state = dw_core::simulate(
+        let state = fky_lapsim_core::simulate(
             &p,
-            &dw_core::Motion {
+            &fky_lapsim_core::Motion {
                 heave: out.equilibrium[0] + h,
                 roll: out.equilibrium[1],
                 pitch: out.equilibrium[2],
@@ -72,7 +72,7 @@ fn asymmetric_springs_produce_coupled_modes_with_small_residuals() {
 #[test]
 fn retained_mass_changes_modal_mass_and_road_motion_is_explicitly_rejected() {
     let (mut p, mut r) = formula_car_demo().unwrap();
-    let mass = dw_core::BodyMass {
+    let mass = fky_lapsim_core::BodyMass {
         mass_kg: 2.,
         center_of_mass: p.corners[0].wheel_center,
         inertia: [[0.01, 0., 0.], [0., 0.01, 0.], [0., 0., 0.01]],
@@ -81,7 +81,7 @@ fn retained_mass_changes_modal_mass_and_road_motion_is_explicitly_rejected() {
     r.mode = RideMode::RetainedComponentInertia;
     let out = linearize_ride(&p, &r).unwrap();
     assert!(out.mass_matrix[1][1] > 100.);
-    r.road = dw_core::RoadInput::Sine {
+    r.road = fky_lapsim_core::RoadInput::Sine {
         amplitude_m: 0.01,
         frequency_hz: 1.,
         phases_rad: [0.; 4],

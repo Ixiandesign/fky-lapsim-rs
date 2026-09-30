@@ -1,18 +1,18 @@
 [package]
-name = "dw-python"
+name = "fky-lapsim-python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "PyO3 bindings exposing dw-core to Python as the dwsuspension._native extension module."
+description = "PyO3 bindings exposing fky-lapsim-core to Python as the fky_lapsim._native extension module."
 publish = false
 [lib]
 name = "_native"
 crate-type = ["cdylib"]
 [dependencies]
-dw-core = { path = "../dw-core" }
+fky-lapsim-core = { path = "../fky-lapsim-core" }
 pyo3 = { version = "0.27", features = ["extension-module"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde = "1"

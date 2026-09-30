@@ -1,4 +1,4 @@
-use dw_core::{optimize::*, Project};
+use fky_lapsim_core::{optimize::*, Project};
 fn request() -> OptimizationRequest {
     OptimizationRequest {
         variables: vec![Variable {
@@ -117,9 +117,9 @@ fn fixed_design_has_no_fake_population() {
 fn real_geometry_reachable_shock_target() {
     let p = Project::example();
     let mut r = request();
-    r.scenarios = vec![dw_core::Motion::default()];
+    r.scenarios = vec![fky_lapsim_core::Motion::default()];
     r.targets[0].metric = "shock_length_m".into();
-    r.targets[0].corner = Some(dw_core::CornerId::FrontLeft);
+    r.targets[0].corner = Some(fky_lapsim_core::CornerId::FrontLeft);
     r.targets[0].value = (0.19_f64.powi(2) + 0.15_f64.powi(2)).sqrt();
     r.validation_samples = 0;
     r.max_seconds = 120.;
@@ -170,11 +170,11 @@ fn held_out_failure_and_retained_cases() {
     assert_eq!(out.status, "validation_failed");
     assert!(!out.validation.unwrap().feasible);
     r.scenarios = vec![
-        dw_core::Motion {
+        fky_lapsim_core::Motion {
             heave: 1000.,
             ..Default::default()
         },
-        dw_core::Motion::default(),
+        fky_lapsim_core::Motion::default(),
     ];
     let e = evaluate_candidate(&p, &r, &[0.15]).unwrap();
     assert!(!e.feasible);
@@ -218,9 +218,9 @@ fn budget_reserve_and_worker_determinism() {
 fn target_curve_squares_before_aggregation() {
     let p = Project::example();
     let mut r = request();
-    r.scenarios = vec![dw_core::Motion::default(); 2];
+    r.scenarios = vec![fky_lapsim_core::Motion::default(); 2];
     let y = (0.25_f64.powi(2) + 0.15_f64.powi(2)).sqrt();
-    r.targets[0].corner = Some(dw_core::CornerId::FrontLeft);
+    r.targets[0].corner = Some(fky_lapsim_core::CornerId::FrontLeft);
     r.targets[0].metric = "shock_length_m".into();
     r.targets[0].values = Some(vec![y - 0.01, y + 0.01]);
     r.targets[0].scale = 0.01;
@@ -245,7 +245,7 @@ fn invalid_project_attempt_has_no_phantom_physics() {
             upper: 1.,
         },
     };
-    r.scenarios = vec![dw_core::Motion::default()];
+    r.scenarios = vec![fky_lapsim_core::Motion::default()];
     let e = evaluate_candidate(&p, &r, &[-0.5]).unwrap();
     assert_eq!(e.failed_cases, 2);
     assert_eq!(e.physics_cases_completed, 0);
@@ -286,7 +286,7 @@ fn real_ride_spring_and_damper_objectives() {
             upper: 70000.,
         },
     };
-    r.ride_request = Some(dw_core::RideRequest {
+    r.ride_request = Some(fky_lapsim_core::RideRequest {
         duration_s: 0.01,
         dt_s: 0.005,
         solve_equilibrium: false,
@@ -339,10 +339,10 @@ fn real_ride_spring_and_damper_objectives() {
         .model_fidelity
         .is_some());
 }
-fn synthetic_ride() -> dw_core::RideRun {
+fn synthetic_ride() -> fky_lapsim_core::RideRun {
     let samples = [0., 0.25, 1.]
         .into_iter()
-        .map(|t| dw_core::RideSample {
+        .map(|t| fky_lapsim_core::RideSample {
             state: None,
             time_s: t,
             displacement: [-2. * t, 3. * t, -4. * t],
@@ -361,7 +361,7 @@ fn synthetic_ride() -> dw_core::RideRun {
             energy_balance_error_j: 0.,
         })
         .collect();
-    dw_core::RideRun {
+    fky_lapsim_core::RideRun {
         model_fidelity: "fixture".into(),
         corner_ids: Project::example().corners.map(|c| c.id),
         equilibrium: None,
@@ -384,7 +384,7 @@ fn uneven_ride_quadrature_and_partial_termination() {
         ride_summary(&run, 1.).unwrap()["ride.rms_heave_acceleration_m_s2"],
         2.
     );
-    run.termination = Some(dw_core::RideTermination {
+    run.termination = Some(fky_lapsim_core::RideTermination {
         time_s: 1.,
         last_valid_time_s: Some(1.),
         corner: None,
@@ -401,7 +401,7 @@ fn scheduled_work_cap_is_checked() {
     let mut r = request();
     r.max_evaluations = 1_000_000;
     r.training_samples = 256;
-    r.scenarios = vec![dw_core::Motion::default(); 128];
+    r.scenarios = vec![fky_lapsim_core::Motion::default(); 128];
     assert!(OptimizationSession::start(&p, &r).is_err());
 }
 
@@ -410,7 +410,7 @@ fn cancelled_case_is_incomplete_not_survivor_average() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let p = Project::example();
     let mut r = request();
-    r.scenarios = vec![dw_core::Motion::default(); 2];
+    r.scenarios = vec![fky_lapsim_core::Motion::default(); 2];
     let polls = AtomicUsize::new(0);
     let e = evaluate_candidate_controlled(&p, &r, &[0.15], false, &|| {
         polls.fetch_add(1, Ordering::Relaxed) >= 2
@@ -455,13 +455,13 @@ fn forged_cached_winner_is_recomputed() {
 fn global_vehicle_metrics_use_no_corner_selector() {
     let p = Project::example();
     let mut r = request();
-    r.scenarios = vec![dw_core::Motion::default()];
+    r.scenarios = vec![fky_lapsim_core::Motion::default()];
     r.targets[0].metric = "vehicle.left_wheelbase_m".into();
     r.targets[0].value = 2.6;
     let e = evaluate_candidate(&p, &r, &[0.15]).unwrap();
     assert!(e.feasible);
     assert!(e.score.unwrap() < 1e-20);
-    r.targets[0].corner = Some(dw_core::CornerId::FrontLeft);
+    r.targets[0].corner = Some(fky_lapsim_core::CornerId::FrontLeft);
     assert!(evaluate_candidate(&p, &r, &[0.15]).is_err());
 }
 #[test]
@@ -525,7 +525,7 @@ fn relations_discrete_and_correlated_uncertainty() {
     }];
     assert_eq!(
         candidate_project(&p, &r, &[1.]).unwrap().corners[0].tire_profile,
-        dw_core::TireProfile::Torus
+        fky_lapsim_core::TireProfile::Torus
     );
     assert!(candidate_project(&p, &r, &[0.5]).is_err());
     r.relations = vec![
@@ -551,8 +551,8 @@ fn shuffled_corner_ids_keep_geometry_objective() {
     q.corners.swap(0, 3);
     let mut r = request();
     r.targets[0].metric = "shock_length_m".into();
-    r.targets[0].corner = Some(dw_core::CornerId::FrontLeft);
-    r.scenarios = vec![dw_core::Motion::default()];
+    r.targets[0].corner = Some(fky_lapsim_core::CornerId::FrontLeft);
+    r.scenarios = vec![fky_lapsim_core::Motion::default()];
     let a = evaluate_candidate(&p, &r, &[0.21]).unwrap();
     r.variables[0].path = "/corners/3/shock_chassis/1".into();
     let b = evaluate_candidate(&q, &r, &[0.21]).unwrap();
@@ -580,7 +580,7 @@ fn truncated_failure_details_preserve_each_case_status() {
     let p = Project::example();
     let mut r = request();
     r.scenarios = vec![
-        dw_core::Motion {
+        fky_lapsim_core::Motion {
             heave: 1000.,
             ..Default::default()
         };
@@ -740,7 +740,7 @@ fn optimize_targets_interconnect_heave_wheel_rate() {
         .unwrap()
         .heave
         .spring_rate = known_rate;
-    let known_metric = dw_core::analyze(&known_project, &dw_core::Motion::default())
+    let known_metric = fky_lapsim_core::analyze(&known_project, &fky_lapsim_core::Motion::default())
         .unwrap()
         .front
         .heave_wheel_rate_n_per_m
@@ -763,7 +763,7 @@ fn optimize_targets_interconnect_heave_wheel_rate() {
             weight: 1.,
             aggregation: Aggregation::MeanSquared,
         }],
-        scenarios: vec![dw_core::Motion::default()],
+        scenarios: vec![fky_lapsim_core::Motion::default()],
         max_evaluations: 400,
         generations: 30,
         population_size: 10,

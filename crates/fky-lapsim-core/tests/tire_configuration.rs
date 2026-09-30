@@ -1,5 +1,5 @@
-use dw_core::tire_configuration::{ConfiguredTire, TireDomain, Provenance, tire_input};
-use dw_core::CornerId;
+use fky_lapsim_core::tire_configuration::{ConfiguredTire, TireDomain, Provenance, tire_input};
+use fky_lapsim_core::CornerId;
 
 #[test]
 fn frame_conversion_opposes_lateral_sliding_on_both_sides() {
@@ -24,9 +24,9 @@ fn declared_domain_and_provenance_are_enforced_not_silently_clamped() {
         max_abs_slip_ratio: 0.3, max_abs_camber_rad: 0.15, speed_m_s: [1., 40.] };
     let input = tire_input(CornerId::FrontLeft, 700., [10., 0.], 40., 0.25, 0.).unwrap();
     assert!(t.evaluate(input).is_ok());
-    for bad in [dw_core::tire::TireInput { normal_load_n: 1001., ..input },
-        dw_core::tire::TireInput { speed_m_s: 0., ..input },
-        dw_core::tire::TireInput { slip_ratio: 0.31, ..input }] {
+    for bad in [fky_lapsim_core::tire::TireInput { normal_load_n: 1001., ..input },
+        fky_lapsim_core::tire::TireInput { speed_m_s: 0., ..input },
+        fky_lapsim_core::tire::TireInput { slip_ratio: 0.31, ..input }] {
         assert!(t.evaluate(bad).is_err());
     }
     t.provenance = Provenance::Measured { source: "".into(), fit_notes: "".into() };

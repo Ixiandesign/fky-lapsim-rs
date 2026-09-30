@@ -1,21 +1,21 @@
-# dw-core
+# fky-lapsim-core
 
 Rigid-body kinematics, geometry analysis, ride dynamics, and optimization for
 double-wishbone suspension systems, aimed at formula-style race cars. Pure
 Rust, no I/O, no Python or UI dependency — the numerical engine behind
-[DWSuspensionLib](https://github.com/Ixiandesign/DWSuspensionLib).
+[FKY-LAPSIM](https://github.com/Ixiandesign/FKY-LAPSIM).
 
 All bodies are rigid except the spring and damper, which are explicit force
 laws. Coordinates are SI (metres), x forward / y left / z up; commanded
 angles are radians. The corner solver uses quaternion tangent-space
 Newton–Raphson with continuation for large travel; see
-[the research notes](https://github.com/Ixiandesign/DWSuspensionLib/blob/main/docs/research/suspension-research.md)
+[the research notes](https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/research/suspension-research.md)
 for the numerical method and physics assumptions behind it.
 
 ```rust
-use dw_core::{analyze, simulate, Motion, Project};
+use fky_lapsim_core::{analyze, simulate, Motion, Project};
 
-fn main() -> Result<(), dw_core::Error> {
+fn main() -> Result<(), fky_lapsim_core::Error> {
     let project = Project::example();
     project.validate()?;
 
@@ -58,8 +58,8 @@ fn main() -> Result<(), dw_core::Error> {
   (`optimize`).
 
 Full usage guide, conventions, and validation evidence:
-[docs/rust-guide.md](https://github.com/Ixiandesign/DWSuspensionLib/blob/main/docs/rust-guide.md),
-[docs/model-conventions.md](https://github.com/Ixiandesign/DWSuspensionLib/blob/main/docs/model-conventions.md),
-[docs/validation.md](https://github.com/Ixiandesign/DWSuspensionLib/blob/main/docs/validation.md).
+[docs/rust-guide.md](https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/rust-guide.md),
+[docs/model-conventions.md](https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md),
+[docs/validation.md](https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/validation.md).
 
 Licensed under Apache-2.0.

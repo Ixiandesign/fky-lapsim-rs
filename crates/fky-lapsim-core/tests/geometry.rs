@@ -1,13 +1,13 @@
-use dw_core::*;
+use fky_lapsim_core::*;
 
 #[test]
 fn legacy_analysis_does_not_invent_a_caster_derivative() {
-    let analysis = dw_core::analysis::analyze(&Project::example(), &Motion::default()).unwrap();
+    let analysis = fky_lapsim_core::analysis::analyze(&Project::example(), &Motion::default()).unwrap();
     let mut data = serde_json::to_value(analysis).unwrap();
     for corner in data["corners"].as_array_mut().unwrap() {
         corner.as_object_mut().unwrap().remove("caster_gain_deg_per_m");
     }
-    let restored: dw_core::analysis::Analysis = serde_json::from_value(data).unwrap();
+    let restored: fky_lapsim_core::analysis::Analysis = serde_json::from_value(data).unwrap();
     assert!(restored.corners[0].caster_gain_deg_per_m.value.is_none());
     assert!(restored.corners[0].caster_gain_deg_per_m.reason.is_some());
 }
@@ -57,20 +57,20 @@ fn finite_steering_scrub_uses_wheel_axes() {
     p.contact_point = rotate([0.1, 0.5, 0.0]);
     p.spindle_axis = [rotate([0.0, 0.0, 0.0]), rotate([0.0, 1.0, 0.0])];
     // Public alignment helper permits independent rigid orientation oracles.
-    let m = dw_core::metrics::measure(&c, &p, [0.0; 3]);
+    let m = fky_lapsim_core::metrics::measure(&c, &p, [0.0; 3]);
     assert!((m.scrub_radius_m.unwrap() - 0.2).abs() < 1e-12);
     assert!((m.mechanical_trail_m.unwrap() - 0.1).abs() < 1e-12);
 }
 #[test]
 fn preload_geometry_stiffness_oracle() {
     assert_eq!(
-        dw_core::analysis::wheel_rate(1000.0, 100.0, 0.5, 2.0),
+        fky_lapsim_core::analysis::wheel_rate(1000.0, 100.0, 0.5, 2.0),
         450.0
     );
 }
 #[test]
 fn planar_instant_center_oracle() {
-    let ic = dw_core::analysis::projected_center([0.8, 0.6], [0.8, 0.3], [0.2, 0.8], [0.5, 0.8]);
+    let ic = fky_lapsim_core::analysis::projected_center([0.8, 0.6], [0.8, 0.3], [0.2, 0.8], [0.5, 0.8]);
     let p = ic.point_yz_m.expect("finite center");
     assert!((p[0] - 0.0).abs() < 1e-12 && (p[1] - 0.8).abs() < 1e-12);
 }
@@ -218,7 +218,7 @@ fn vertical_torus_contact_is_on_ring_not_in_hole() {
 }
 #[test]
 fn undefined_projected_geometry_and_spring_knots_keep_reasons() {
-    use dw_core::analysis::{geometric_roll_center, projected_center};
+    use fky_lapsim_core::analysis::{geometric_roll_center, projected_center};
     let zero = projected_center([0.8, 0.6], [0.8, 0.3], [0.0, 0.0], [0.0, 1.0]);
     assert!(zero.point_yz_m.is_none() && zero.reason.is_some());
     let coincident = projected_center([0.8, 0.6], [0.4, 0.6], [0.0, 1.0], [0.0, 1.0]);

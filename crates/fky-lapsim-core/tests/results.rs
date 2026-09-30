@@ -1,4 +1,4 @@
-use dw_core::results::result_table;
+use fky_lapsim_core::results::result_table;
 use serde_json::json;
 
 #[test]

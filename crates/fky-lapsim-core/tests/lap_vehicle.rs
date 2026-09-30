@@ -1,4 +1,4 @@
-use dw_core::lap::{LapVehicle,LapState,LapControls,evaluate_vehicle};
+use fky_lapsim_core::lap::{LapVehicle,LapState,LapControls,evaluate_vehicle};
 
 #[test]
 fn coast_and_lateral_slip_preserve_force_balance_and_frame_signs() {

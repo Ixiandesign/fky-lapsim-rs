@@ -1,5 +1,5 @@
-use dw_core::dynamics::*;
-use dw_core::{Project, SpringDamper};
+use fky_lapsim_core::dynamics::*;
+use fky_lapsim_core::{Project, SpringDamper};
 
 fn close(a: f64, b: f64, tol: f64) {
     assert!((a - b).abs() <= tol, "{a} != {b} (tolerance {tol})");
@@ -162,13 +162,13 @@ fn coupled_force_matches_independent_potential_gradient_and_road_work() {
     let z = phases.map(|phase: f64| amp * phase.sin());
     let zd = phases.map(|phase: f64| amp * omega * phase.cos());
     let compression = |q: [f64; 3], z| {
-        let m = dw_core::Motion {
+        let m = fky_lapsim_core::Motion {
             heave: q[0],
             roll: q[1],
             pitch: q[2],
             ..Default::default()
         };
-        dw_core::simulate_on_road(&p, &m, z)
+        fky_lapsim_core::simulate_on_road(&p, &m, z)
             .unwrap()
             .corners
             .map(|c| c.metrics.shock_compression_m)
@@ -463,9 +463,9 @@ fn moving_road_velocity_matches_direct_derivatives_at_tilted_pose() {
     let q = [0.004, 0.009, -0.007];
     let z = [0.001, 0.002, -0.001, -0.002];
     let state = |q: [f64; 3], z: [f64; 4]| {
-        dw_core::simulate_on_road(
+        fky_lapsim_core::simulate_on_road(
             &p,
-            &dw_core::Motion {
+            &fky_lapsim_core::Motion {
                 heave: q[0],
                 roll: q[1],
                 pitch: q[2],

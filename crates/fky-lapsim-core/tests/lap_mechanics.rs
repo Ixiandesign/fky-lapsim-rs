@@ -1,4 +1,4 @@
-use dw_core::{lap::suspension_forces, dynamics::{formula_car_demo, evaluate_ride}, RideRequest};
+use fky_lapsim_core::{lap::suspension_forces, dynamics::{formula_car_demo, evaluate_ride}, RideRequest};
 
 #[test]
 fn suspension_virtual_work_matches_ride_and_corner_order_is_irrelevant() {
@@ -16,7 +16,7 @@ fn suspension_virtual_work_matches_ride_and_corner_order_is_irrelevant() {
 
 #[test]
 fn suspension_force_is_negative_potential_gradient_with_interconnects() {
-    let p=dw_core::Project::example_with_interconnect();
+    let p=fky_lapsim_core::Project::example_with_interconnect();
     let q=[-0.02,0.003,0.002];
     let s=suspension_forces(&p,q,[0.;3],0.,0.).unwrap();
     for j in 0..3 {

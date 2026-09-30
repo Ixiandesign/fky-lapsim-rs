@@ -1,4 +1,4 @@
-use dw_core::study::{motion_grid, AxisRange, GridMode, MotionGrid};
+use fky_lapsim_core::study::{motion_grid, AxisRange, GridMode, MotionGrid};
 
 #[test]
 fn combined_grid_includes_endpoints_and_fixed_rack() {

@@ -1,4 +1,4 @@
-use dw_core::tire::{TireInput, TireModel};
+use fky_lapsim_core::tire::{TireInput, TireModel};
 
 fn fixture() -> TireModel {
     // C=1,E=0: sin(atan(x)) = x/sqrt(1+x*x), an independent analytic oracle.

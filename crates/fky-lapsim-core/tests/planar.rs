@@ -1,4 +1,4 @@
-use dw_core::planar::{balance, contact_velocity, PlanarState, WheelForce};
+use fky_lapsim_core::planar::{balance, contact_velocity, PlanarState, WheelForce};
 
 #[test]
 fn four_wheel_balance_retains_left_right_traction_yaw_and_aligning_moments() {

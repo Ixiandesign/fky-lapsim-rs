@@ -1,12 +1,12 @@
-//! `cargo run -p dw-core --release --example fsae_demo` loads the FSAE generic
+//! `cargo run -p fky-lapsim-core --release --example fsae_demo` loads the FSAE generic
 //! project (examples/fsae-generic-project.json, built from a published OptimumG
 //! case study - see examples/build_fsae_project.py for provenance) and exercises
 //! geometry solving, a motion sweep, and a native geometry optimization directly
 //! through the Rust API. Run from the repository root so the relative example
 //! path resolves.
 
-use dw_core::optimize::{Aggregation, OptimizationRequest, Target, Variable, VariableKind};
-use dw_core::{analyze, simulate, sweep, Motion, Project};
+use fky_lapsim_core::optimize::{Aggregation, OptimizationRequest, Target, Variable, VariableKind};
+use fky_lapsim_core::{analyze, simulate, sweep, Motion, Project};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string("examples/fsae-generic-project.json")
@@ -79,13 +79,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ],
         relations: vec![
-            dw_core::optimize::Relation {
+            fky_lapsim_core::optimize::Relation {
                 source: "/corners/0/upper_front/2".into(),
                 destination: "/corners/1/upper_front/2".into(),
                 factor: 1.0,
                 offset: 0.0,
             },
-            dw_core::optimize::Relation {
+            fky_lapsim_core::optimize::Relation {
                 source: "/corners/0/upper_rear/2".into(),
                 destination: "/corners/1/upper_rear/2".into(),
                 factor: 1.0,
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         ],
         targets: vec![Target {
-            corner: Some(dw_core::CornerId::FrontLeft),
+            corner: Some(fky_lapsim_core::CornerId::FrontLeft),
             metric: "analysis.camber_gain_deg_per_m".into(),
             value: 0.0,
             values: None,
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: 2,
         ..Default::default()
     };
-    let result = dw_core::optimize::optimize(&project, &request)?;
+    let result = fky_lapsim_core::optimize::optimize(&project, &request)?;
     println!("  status: {}", result.status);
     if let Some(baseline) = &result.baseline {
         println!("  baseline score: {:?}", baseline.evaluation.score);

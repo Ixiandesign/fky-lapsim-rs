@@ -1,4 +1,4 @@
-use dw_core::*;
+use fky_lapsim_core::*;
 #[test]
 fn analytic_parallel_arm_arc() {
     let c = &Project::example().corners[0];

@@ -1,4 +1,4 @@
-use dw_core::{dynamics::formula_car_demo, ride, Project, RideRequest};
+use fky_lapsim_core::{dynamics::formula_car_demo, ride, Project, RideRequest};
 fn massive() -> (Project, RideRequest) {
     let (p, r) = formula_car_demo().unwrap();
     let mut value = serde_json::to_value(p).unwrap();
@@ -49,7 +49,7 @@ fn massive_with_interconnect() -> (Project, RideRequest) {
     }
     let p: Project = serde_json::from_value(value).unwrap();
     let r = RideRequest {
-        mode: dw_core::RideMode::RetainedComponentInertia,
+        mode: fky_lapsim_core::RideMode::RetainedComponentInertia,
         duration_s: 0.,
         solve_equilibrium: false,
         initial_displacement: [0., 0., 0.],
@@ -118,7 +118,7 @@ fn all_mass() -> (Project, RideRequest) {
     let (mut p, mut r) = massive();
     for c in &mut p.corners {
         let body = |point| {
-            Some(dw_core::BodyMass {
+            Some(fky_lapsim_core::BodyMass {
                 mass_kg: 1.5,
                 center_of_mass: point,
                 inertia: [[0.01, 0., 0.], [0., 0.02, 0.], [0., 0., 0.025]],
@@ -132,7 +132,7 @@ fn all_mass() -> (Project, RideRequest) {
     r.initial_displacement = [0.003, 0.001, -0.0005];
     (p, r)
 }
-fn finish(p: &Project, r: &RideRequest) -> dw_core::RideRun {
+fn finish(p: &Project, r: &RideRequest) -> fky_lapsim_core::RideRun {
     let run = ride(p, r).unwrap();
     assert!(run.termination.is_none(), "{:?}", run.termination);
     run
@@ -141,7 +141,7 @@ fn finish(p: &Project, r: &RideRequest) -> dw_core::RideRun {
 fn moving_knuckle_inertial_support() {
     let (p, mut r) = massive();
     r.solve_equilibrium = false;
-    r.road = dw_core::RoadInput::Sine {
+    r.road = fky_lapsim_core::RoadInput::Sine {
         amplitude_m: 0.002,
         frequency_hz: 3.,
         phases_rad: [std::f64::consts::FRAC_PI_2; 4],
@@ -164,10 +164,10 @@ fn asymmetric_mass_changes_equilibrium_and_zero_limit() {
         .unwrap()
         .mass_kg = 8.;
     let mass = finish(&p, &r);
-    r.mode = dw_core::RideMode::Reduced;
+    r.mode = fky_lapsim_core::RideMode::Reduced;
     let reduced = finish(&p, &r);
     assert!((mass.equilibrium.unwrap()[1] - reduced.equilibrium.unwrap()[1]).abs() > 1e-5);
-    r.mode = dw_core::RideMode::RetainedComponentInertia;
+    r.mode = fky_lapsim_core::RideMode::RetainedComponentInertia;
     for c in &mut p.corners {
         for b in [
             &mut c.component_masses.upper_arm,
@@ -199,13 +199,13 @@ fn energy_timestep_derivative_and_runtime_gates() {
         }
         for moving in [false, true] {
             r.road = if moving {
-                dw_core::RoadInput::Sine {
+                fky_lapsim_core::RoadInput::Sine {
                     amplitude_m: 0.001,
                     frequency_hz: 2.,
                     phases_rad: [0., 0.3, 0.1, -0.2],
                 }
             } else {
-                dw_core::RoadInput::Flat
+                fky_lapsim_core::RoadInput::Flat
             };
             let mut errors = Vec::new();
             let mut final_states = Vec::new();
@@ -269,14 +269,14 @@ fn energy_timestep_derivative_and_runtime_gates() {
 #[test]
 fn mass_road_history_rejected_and_cylinder_cusp_diagnostic() {
     let (mut p, mut r) = massive();
-    r.road = dw_core::RoadInput::Histories {
+    r.road = fky_lapsim_core::RoadInput::Histories {
         corners: std::array::from_fn(|_| vec![[0., 0.], [1., 0.01]]),
     };
     assert!(ride(&p, &r).unwrap_err().message.contains("C1 road"));
-    r.road = dw_core::RoadInput::Flat;
+    r.road = fky_lapsim_core::RoadInput::Flat;
     r.solve_equilibrium = false;
     for c in &mut p.corners {
-        c.tire_profile = dw_core::TireProfile::Cylinder;
+        c.tire_profile = fky_lapsim_core::TireProfile::Cylinder;
     }
     let run = ride(&p, &r).unwrap();
     assert!(run.termination.is_some());
@@ -288,7 +288,7 @@ fn torus_fixed_steering_and_permutation() {
     r.rack_front = 0.001;
     r.rack_rear = -0.0005;
     for c in &mut p.corners {
-        c.tire_profile = dw_core::TireProfile::Torus;
+        c.tire_profile = fky_lapsim_core::TireProfile::Torus;
     }
     let run = finish(&p, &r);
     p.corners.swap(0, 3);

@@ -1,4 +1,4 @@
-use dw_core::*;
+use fky_lapsim_core::*;
 #[test]
 fn heave_changes_every_shock() {
     let p = Project::example();
@@ -51,7 +51,7 @@ fn rest_recovery_and_failed_samples() {
 
 #[test]
 fn detailed_sweep_retains_derivatives_and_failed_rows() {
-    let rows = dw_core::study::detailed_sweep(
+    let rows = fky_lapsim_core::study::detailed_sweep(
         &Project::example(),
         &[
             Motion::default(),

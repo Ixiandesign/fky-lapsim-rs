@@ -497,13 +497,13 @@ pub(crate) fn continuation_tolerance(
 /// the design pose for large travel. Returned points are in the chassis frame.
 ///
 /// ```rust
-/// use dw_core::{solve_corner, Project};
+/// use fky_lapsim_core::{solve_corner, Project};
 ///
 /// let project = Project::example();
 /// let corner = &project.corners[0];
 /// let state = solve_corner(corner, 0.01, 0.0)?;
 /// assert!(state.max_residual_m < 1e-6);
-/// # Ok::<(), dw_core::Error>(())
+/// # Ok::<(), fky_lapsim_core::Error>(())
 /// ```
 pub fn solve_corner(c: &Corner, jounce: f64, rack: f64) -> Result<CornerState, Error> {
     if !jounce.is_finite() || !rack.is_finite() {
