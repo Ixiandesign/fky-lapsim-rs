@@ -6,6 +6,6 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/Ixiandesign/FKY-LAPSIM"
+repository = "https://github.com/Ixiandesign/fky-lapsim-rs"
 authors = ["Kaden Mahoney"]
 rust-version = "1.96"
