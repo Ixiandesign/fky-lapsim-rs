@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fky-lapsim"
+dynamic = ["version"]
+description = "FKY LAPSIM physics engine: suspension kinematics, ride dynamics, lap simulation, and optimization."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "Kaden Mahoney" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+manifest-path = "crates/fky-lapsim-python/Cargo.toml"
+python-source = "python"
+module-name = "fky_lapsim._native"

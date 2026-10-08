@@ -19,3 +19,20 @@ Coordinates are SI (metres), x forward / y left / z up; commanded angles are rad
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).
+
+## Python
+
+```bash
+pip install maturin
+maturin develop --release   # editable install into the active venv
+maturin build --release -o dist   # or build a wheel: pip install dist/*.whl
+```
+
+```python
+import fky_lapsim as fl
+p = fl.example_project()
+state = fl.simulate(p, fl.defaults()["motion"])
+lap = fl.run_lap(fl.lap_vehicle_demo(), fl.track_demo(), {})
+```
+
+Every native op is a function returning plain dicts; `fl.call(op, **fields)` reaches any op directly. `fl.OptimizationSession` gives incremental, cancellable, checkpointable optimization.
