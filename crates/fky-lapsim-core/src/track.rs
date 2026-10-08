@@ -1,30 +1,51 @@
-//! Closed planar centerline geometry in meters.
+//! Closed planar centerline geometry in meters, used as the path a
+//! lap-simulation vehicle (`crate::lap`) drives around.
+//!
+//! A [`Track`] is a typed or CSV-imported ordered point list, or one built
+//! synthetically with [`Track::circle`]/[`Track::oval`]; [`Track::sample`]
+//! turns an arc-length coordinate into position/heading/curvature by
+//! piecewise-linear interpolation along that polygon, wrapping both positive
+//! and negative laps. See
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the crate's coordinate conventions.
 use serde::{Deserialize, Serialize};
 /// Closed polygonal path with a continuous, interpolated curvature estimate.
+/// Self-intersections are permitted (e.g. a mapped crossover course); see
+/// [`Track::validate`] for what is rejected instead.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Track {
-    /// Ordered XY centerline points, meters; closure is implicit. An identical
-    /// final copy of the first point is accepted and ignored.
+    /// Ordered XY centerline points, meters; closure is implicit (the path
+    /// returns from the last point to the first). An identical final copy of
+    /// the first point is accepted and ignored, so either a closed or
+    /// explicitly-repeated-first-point list works.
     pub centerline_m: Vec<[f64; 2]>,
-    /// Constant full track width, meters.
+    /// Constant full track width, meters. Must be finite and strictly
+    /// positive.
     pub width_m: f64,
 }
-/// Periodic centerline sample.
+/// One periodic sample of a [`Track`]'s centerline, returned by
+/// [`Track::sample`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackSample {
-    /// Wrapped polygon arc length, meters.
+    /// The requested arc length, wrapped into `[0, length_m)` by
+    /// [`Track::sample`] (see [`Track::length_m`]).
     pub s_m: f64,
-    /// Linear interpolation along the polygon, meters.
+    /// World XY position at `s_m`, linearly interpolated along the polygon
+    /// segment containing it, meters.
     pub position_m: [f64; 2],
-    /// Unit tangent to the containing polygon segment.
+    /// Unit tangent to the containing polygon segment, pointing in the
+    /// direction of increasing arc length.
     pub tangent: [f64; 2],
-    /// Segment heading counterclockwise from +X, radians.
+    /// Segment heading, counterclockwise from +X, radians; `atan2` of
+    /// `tangent`.
     pub heading_rad: f64,
-    /// Signed three-point circumcircle curvature interpolated between vertices,
-    /// 1/m. Positive is a left bend. This estimates the sampled smooth path,
-    /// rather than the distributional curvature of the literal polygon.
+    /// Signed three-point circumcircle curvature interpolated between
+    /// vertices, 1/m. Positive is a left bend. This estimates the sampled
+    /// smooth path, rather than the distributional curvature of the literal
+    /// polygon.
     pub curvature_per_m: f64,
-    /// Full width, meters.
+    /// Full track width at this point, meters; currently always equal to the
+    /// parent [`Track::width_m`] since width is constant along the track.
     pub width_m: f64,
 }
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -39,8 +60,23 @@ impl Track {
             p
         }
     }
-    /// Validate closure, finite geometry, positive width and nonzero edges.
-    /// Self intersections are permitted (e.g. a mapped crossover course).
+    /// Validate finite geometry, positive width, and that the (closure-
+    /// normalized) polygon has at least three distinct vertices, no
+    /// zero-length or reversing segment, and no exactly-antiparallel
+    /// (undefined-turn) vertex. Self-intersections are permitted (e.g. a
+    /// mapped crossover course); called first by every other method here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `width_m` is nonfinite or not strictly positive;
+    /// if fewer than three distinct points remain after closure
+    /// normalization, or any point is nonfinite; if a consecutive pair of
+    /// points coincides (a zero-length or otherwise invalid segment); if a
+    /// vertex's incoming and outgoing points coincide (the path reverses
+    /// along itself); if the cross/dot product used to detect a turnaround is
+    /// nonfinite, or the consecutive edges are numerically antiparallel (an
+    /// undefined turn direction, e.g. a spike); or if the accumulated length
+    /// overflows to a nonfinite value.
     pub fn validate(&self) -> Result<(), String> {
         let p = self.points();
         if !self.width_m.is_finite()
@@ -74,7 +110,12 @@ impl Track {
         }
         Ok(())
     }
-    /// Closed polygon length, meters.
+    /// Closed polygon length (sum of all segment lengths, including the
+    /// closing segment back to the first point), meters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Track::validate`] fails.
     pub fn length_m(&self) -> Result<f64, String> {
         self.validate()?;
         let p = self.points();
@@ -93,7 +134,15 @@ impl Track {
             - ((b[1] - a[1]) / ab) * ((c[0] - b[0]) / bc))
             / ac
     }
-    /// Sample any finite arc length, wrapping both positive and negative laps.
+    /// Sample position, heading and curvature at any finite arc length,
+    /// wrapping both positive and negative laps (via [`f64::rem_euclid`])
+    /// into `[0, length_m)` before locating the containing segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Track::validate`] fails, if `s_m` is nonfinite,
+    /// or in the unreachable case that no segment is found to contain the
+    /// wrapped arc length (a floating-point edge case at the wrap boundary).
     pub fn sample(&self, s_m: f64) -> Result<TrackSample, String> {
         let length = self.length_m()?;
         if !s_m.is_finite() {
@@ -126,7 +175,15 @@ impl Track {
         }
         Err("could not locate track segment".into())
     }
-    /// Synthetic counterclockwise circular course, centered at the origin.
+    /// Build a synthetic counterclockwise circular course of the given
+    /// radius, centered at the origin, approximated by `segments` equal
+    /// polygon vertices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `radius_m` is nonfinite or not strictly positive,
+    /// if `segments` is outside `3..=1_000_000`, or if the constructed
+    /// polygon fails [`Track::validate`].
     pub fn circle(radius_m: f64, width_m: f64, segments: usize) -> Result<Self, String> {
         if !radius_m.is_finite() || radius_m <= 0. || !(3..=1_000_000).contains(&segments) {
             return Err("invalid circle radius or segment count".into());
@@ -144,8 +201,20 @@ impl Track {
         track.validate()?;
         Ok(track)
     }
-    /// Synthetic counterclockwise stadium: two straights of the specified
-    /// length and two semicircles. Straight segments use comparable spacing.
+    /// Build a synthetic counterclockwise stadium course: two straights of
+    /// `straight_m` length joined by two semicircles of `radius_m`, each arc
+    /// approximated by `segments_per_arc` vertices. Straight segments are
+    /// spaced to be comparable in length to the arc segments. A zero
+    /// `straight_m` delegates to [`Track::circle`] with `2 * segments_per_arc`
+    /// segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `straight_m` is nonfinite or negative, if
+    /// `radius_m` is nonfinite or not strictly positive, if
+    /// `segments_per_arc` is outside `2..=100_000`, if the number of straight
+    /// segments implied by the requested spacing would exceed 100,000, or if
+    /// the constructed polygon fails [`Track::validate`].
     pub fn oval(
         straight_m: f64,
         radius_m: f64,

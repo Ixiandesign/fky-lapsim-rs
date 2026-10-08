@@ -1,56 +1,94 @@
-//! Validated quasi-static drivetrain; SI torque and angular speed, dyno speed in rpm.
+//! Validated quasi-static drivetrain and braking model used by the
+//! lap-simulation full-car vehicle (`crate::lap`): a piecewise-linear dyno
+//! torque curve, fixed gear ratios and final drive, and a fixed front/rear
+//! brake torque split. SI units throughout except engine/dyno speed, which is
+//! in rpm to match how a dyno curve is normally supplied.
+//!
+//! "Quasi-static" means a locked clutch evaluated at an assumed wheel
+//! angular speed: there is no clutch slip, launch, or engine/driveline
+//! inertia model, and below-idle operation requires an explicit external
+//! launch model this crate does not provide. See
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the crate's broader SI/frame conventions.
 use serde::{Deserialize, Serialize};
-/// One measured or explicitly synthetic dyno knot.
+/// One measured or explicitly synthetic dyno knot: a single full-throttle
+/// torque reading at a given engine speed. A [`Powertrain::torque_curve`] is a
+/// sequence of these, linearly interpolated between neighboring knots.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynoPoint {
-    /// Engine speed, revolutions/minute.
+    /// Engine speed, revolutions/minute. Must be nonnegative and strictly
+    /// increasing from one knot to the next within a [`Powertrain`].
     pub rpm: f64,
-    /// Full-throttle shaft torque, N m.
+    /// Full-throttle shaft torque at this engine speed, N m. Must be
+    /// nonnegative.
     pub torque_nm: f64,
 }
-/// Axle receiving equal left/right drive torque.
+/// Which axle receives drive torque, always split equally left/right.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DrivenAxle {
-    /// Front wheels.
+    /// Front wheels only.
     Front,
-    /// Rear wheels.
+    /// Rear wheels only.
     Rear,
-    /// Equal torque at all four wheels.
+    /// Equal torque at all four wheels (e.g. a four-wheel-drive idealization).
     All,
 }
-/// Fixed-ratio transmission with a piecewise-linear positive torque dyno.
+/// Fixed-ratio transmission with a piecewise-linear positive-torque dyno
+/// curve. [`Powertrain::evaluate`] models an ideal open differential across
+/// the driven axle: no limited-slip or torque-vectoring action is assumed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Powertrain {
-    /// Strictly increasing dyno knots covering idle through redline.
+    /// Dyno knots, strictly increasing in `rpm` and together covering
+    /// `idle_rpm` through `redline_rpm`; see [`Powertrain::torque_at_rpm`].
     pub torque_curve: Vec<DynoPoint>,
-    /// Minimum allowed engine speed, rpm.
+    /// Minimum allowed engine speed, rpm. Must be strictly positive.
     pub idle_rpm: f64,
-    /// Maximum allowed engine speed, rpm.
+    /// Maximum allowed engine speed, rpm. Must be strictly greater than
+    /// `idle_rpm`.
     pub redline_rpm: f64,
-    /// Positive forward ratios; index is the zero-based gear identifier.
+    /// Positive forward gear ratios (engine speed / output speed); index is
+    /// the zero-based gear identifier passed to [`Powertrain::evaluate`].
+    /// Reverse and neutral are not represented.
     pub gear_ratios: Vec<f64>,
-    /// Positive final reduction.
+    /// Positive final-drive reduction applied after the gearbox.
     pub final_drive: f64,
-    /// Mechanical efficiency in (0, 1].
+    /// Mechanical efficiency factor applied to wheel torque, in the range 0
+    /// (exclusive) to 1 (inclusive).
     pub efficiency: f64,
-    /// Driven wheels.
+    /// Which wheels receive drive torque.
     pub driven_axle: DrivenAxle,
 }
-/// Deterministic drivetrain operating point, with locked clutch.
+/// A deterministic drivetrain operating point computed by
+/// [`Powertrain::evaluate`], assuming a locked clutch at the given wheel
+/// angular speed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PowertrainState {
-    /// Zero-based engaged gear.
+    /// Zero-based engaged gear, indexing [`Powertrain::gear_ratios`].
     pub gear: usize,
-    /// Engine speed, rpm.
+    /// Engine speed implied by the wheel angular speed and gearing, rpm.
     pub engine_rpm: f64,
-    /// Shaft torque after throttle, N m.
+    /// Shaft torque after throttle scaling (before gearing/efficiency), N m.
     pub engine_torque_nm: f64,
-    /// Drive torque in FL, FR, RL, RR order, N m.
+    /// Drive torque delivered to each wheel, FL, FR, RL, RR order, N m. Zero
+    /// at any wheel on an axle not selected by [`Powertrain::driven_axle`].
     pub wheel_torques_nm: [f64; 4],
 }
 impl Powertrain {
-    /// Reject nonphysical parameters and incomplete dyno coverage.
+    /// Reject nonphysical parameters and incomplete dyno coverage. Called
+    /// first by every other method on this type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `idle_rpm` or `redline_rpm` is nonfinite,
+    /// `idle_rpm` is not strictly positive, or `redline_rpm <= idle_rpm`; if
+    /// `final_drive` is not finite and strictly positive; if `efficiency` is
+    /// not finite and in `(0, 1]`; if `gear_ratios` is empty or contains a
+    /// nonfinite or nonpositive ratio; if `torque_curve` has fewer than two
+    /// knots, contains a nonfinite or negative `rpm`/`torque_nm`, or is not
+    /// strictly increasing in `rpm`; or if the dyno curve's first knot is
+    /// above `idle_rpm` or its last knot is below `redline_rpm` (incomplete
+    /// coverage).
     pub fn validate(&self) -> Result<(), String> {
         if !self.idle_rpm.is_finite()
             || !self.redline_rpm.is_finite()
@@ -78,7 +116,16 @@ impl Powertrain {
         }
         Ok(())
     }
-    /// Interpolate within the explicit running-speed domain, never extrapolate.
+    /// Linearly interpolate full-throttle shaft torque from
+    /// [`Powertrain::torque_curve`] at the given engine speed, within the
+    /// explicit `idle_rpm`..=`redline_rpm` running-speed domain. Never
+    /// extrapolates beyond the dyno knots or the idle/redline domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Powertrain::validate`] fails, if `rpm` is
+    /// nonfinite or outside `idle_rpm..=redline_rpm`, or in the unreachable
+    /// case that no consecutive knot pair brackets a covered `rpm`.
     pub fn torque_at_rpm(&self, rpm: f64) -> Result<f64, String> {
         self.validate()?;
         if !rpm.is_finite() || rpm < self.idle_rpm || rpm > self.redline_rpm {
@@ -92,9 +139,20 @@ impl Powertrain {
         Ok(p[0].torque_nm
             + (p[1].torque_nm - p[0].torque_nm) * (rpm - p[0].rpm) / (p[1].rpm - p[0].rpm))
     }
-    /// Evaluate a locked clutch using the driven wheels' average angular speed.
-    /// Below idle requires an explicit external launch model. Equal axle torque
-    /// represents an ideal open differential; no limited-slip action is assumed.
+    /// Evaluate a locked clutch using the driven wheels' average angular
+    /// speed, the engaged `gear` and a `throttle` fraction. Below idle
+    /// requires an explicit external launch model this method does not
+    /// provide. Equal left/right axle torque represents an ideal open
+    /// differential; no limited-slip action is assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Powertrain::validate`] fails; if
+    /// `wheel_angular_speed_rad_s` is nonfinite or negative; if `throttle` is
+    /// nonfinite or outside `[0, 1]`; if `gear` is not a valid index into
+    /// [`Powertrain::gear_ratios`]; if the implied engine speed falls outside
+    /// `idle_rpm..=redline_rpm` (see [`Powertrain::torque_at_rpm`]); or if the
+    /// resulting wheel torque overflows to a nonfinite value.
     pub fn evaluate(
         &self,
         wheel_angular_speed_rad_s: f64,
@@ -128,7 +186,20 @@ impl Powertrain {
             wheel_torques_nm,
         })
     }
-    /// Select maximum full-throttle wheel torque among valid gears; ties use first index.
+    /// Search every gear at full throttle and return the index giving the
+    /// greatest total wheel torque at this wheel angular speed; ties keep the
+    /// lowest (first) index. A gear whose implied engine speed falls outside
+    /// `idle_rpm..=redline_rpm` is silently skipped rather than treated as an
+    /// error, as long as at least one gear is in range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Powertrain::validate`] fails, or if no gear's
+    /// implied engine speed lies within `idle_rpm..=redline_rpm` at this
+    /// wheel speed (see [`Powertrain::evaluate`]) — including when
+    /// `wheel_angular_speed_rad_s` itself is nonfinite or negative, since
+    /// every gear then fails the same [`Powertrain::evaluate`] check and is
+    /// skipped the same way.
     pub fn select_gear(&self, wheel_angular_speed_rad_s: f64) -> Result<usize, String> {
         self.validate()?;
         let mut best: Option<(usize, f64)> = None;
@@ -144,16 +215,26 @@ impl Powertrain {
             .ok_or_else(|| "no gear inside engine speed domain".into())
     }
 }
-/// Brake allocation; torque magnitudes must oppose each wheel's rotation.
+/// Fixed front/rear brake torque allocation. [`BrakeConfig::wheel_torques`]
+/// returns torque *magnitudes* only; the caller is responsible for applying
+/// them so as to oppose each wheel's own rotation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrakeConfig {
-    /// Maximum sum of four brake torque magnitudes, N m.
+    /// Maximum sum of all four brake torque magnitudes at full brake command,
+    /// N m. Must be finite and nonnegative.
     pub max_total_torque_nm: f64,
-    /// Fraction assigned to the front axle in [0,1].
+    /// Fraction of total brake torque assigned to the front axle, in the
+    /// range 0 to 1 inclusive; the remainder goes to the rear axle, split
+    /// evenly left/right on each axle.
     pub front_fraction: f64,
 }
 impl BrakeConfig {
-    /// Check finite nonnegative capacity and physical bias.
+    /// Check finite nonnegative capacity and a physically meaningful bias.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_total_torque_nm` is nonfinite or negative, or
+    /// if `front_fraction` is nonfinite or outside `[0, 1]`.
     pub fn validate(&self) -> Result<(), String> {
         if !self.max_total_torque_nm.is_finite()
             || self.max_total_torque_nm < 0.
@@ -164,7 +245,15 @@ impl BrakeConfig {
         }
         Ok(())
     }
-    /// Return nonnegative torque magnitudes in FL, FR, RL, RR order.
+    /// Return nonnegative brake torque magnitudes in FL, FR, RL, RR order for
+    /// a given brake `command` fraction, splitting `command *
+    /// max_total_torque_nm` between front and rear per `front_fraction` and
+    /// evenly left/right on each axle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`BrakeConfig::validate`] fails, or if `command`
+    /// is nonfinite or outside `[0, 1]`.
     pub fn wheel_torques(&self, command: f64) -> Result<[f64; 4], String> {
         self.validate()?;
         if !command.is_finite() || !(0. ..=1.).contains(&command) {

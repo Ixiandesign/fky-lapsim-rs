@@ -1,31 +1,56 @@
-//! Aerodynamic body-frame loads (x forward, y left, z up).
+//! Aerodynamic body-frame loads (x forward, y left, z up) for the
+//! lap-simulation full-car vehicle (`crate::lap`).
+//!
+//! This is a constant-coefficient planar (CL/CD/COP) model: drag and
+//! downforce scale with the square of air-relative body-plane speed through
+//! fixed coefficients, with no yaw sensitivity, ground-effect variation with
+//! ride height, or stall. See
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the crate's coordinate conventions.
 use serde::{Deserialize, Serialize};
 /// Constant-coefficient planar aerodynamics. No yaw sensitivity or ground effect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Aero {
-    /// Air density, kg/m³ (strictly positive).
+    /// Air density, kg/m³. Must be finite and strictly positive.
     pub air_density_kg_m3: f64,
-    /// Reference area, m² (nonnegative permits disabling aero).
+    /// Reference area, m², used with the drag/downforce coefficients to form
+    /// dynamic pressure loads. Must be finite and nonnegative; zero disables
+    /// aero entirely.
     pub reference_area_m2: f64,
-    /// Nonnegative drag coefficient.
+    /// Drag coefficient. Must be finite and nonnegative.
     pub drag_coefficient: f64,
-    /// Nonnegative coefficient; positive means force toward negative body z.
+    /// Downforce coefficient. Must be finite and nonnegative; a positive
+    /// value produces force toward negative body z (downforce, not lift).
     pub downforce_coefficient: f64,
-    /// Body-frame center of pressure relative to CG, meters.
+    /// Body-frame center of pressure relative to the vehicle CG, metres. Must
+    /// be finite; otherwise unconstrained.
     pub center_of_pressure_m: [f64; 3],
 }
-/// Force at the center of pressure and its equivalent CG moment.
+/// Aerodynamic force at the center of pressure, plus that force's equivalent
+/// moment about the CG, both in the body frame. Returned by [`Aero::evaluate`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AeroState {
-    /// Planar dynamic pressure, Pa.
+    /// Dynamic pressure from the planar (x-y) air-relative speed, Pa. Always
+    /// nonnegative.
     pub dynamic_pressure_pa: f64,
-    /// Body force, N.
+    /// Body-frame aerodynamic force, N. The z component is the downforce
+    /// term; drag acts opposite the planar velocity direction.
     pub force_n: [f64; 3],
-    /// Body moment about CG, N m.
+    /// Body-frame moment about the CG equivalent to `force_n` acting at
+    /// [`Aero::center_of_pressure_m`], N·m.
     pub moment_nm: [f64; 3],
 }
 impl Aero {
-    /// Check coefficient domains and finite geometry.
+    /// Check that all coefficients and the center-of-pressure geometry are
+    /// finite and within their physical domains. Called first by
+    /// [`Aero::evaluate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `air_density_kg_m3` is nonfinite or not strictly
+    /// positive; if `reference_area_m2`, `drag_coefficient` or
+    /// `downforce_coefficient` is nonfinite or negative; or if any component
+    /// of `center_of_pressure_m` is nonfinite.
     pub fn validate(&self) -> Result<(), String> {
         if !self.air_density_kg_m3.is_finite()
             || self.air_density_kg_m3 <= 0.
@@ -42,8 +67,18 @@ impl Aero {
         }
         Ok(())
     }
-    /// Evaluate air-relative body velocity. Drag opposes its XY component;
-    /// vertical velocity is ignored by this explicitly planar model.
+    /// Evaluate aerodynamic force and moment from an air-relative body
+    /// velocity. Dynamic pressure and drag use only the x-y (planar) speed
+    /// component; vertical velocity is ignored by this explicitly planar
+    /// model. Drag opposes the planar velocity direction; downforce acts
+    /// along negative body z regardless of direction of travel. A zero
+    /// planar velocity returns all-zero force without dividing by zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`Aero::validate`] fails, if any component of
+    /// `body_velocity_m_s` is nonfinite, or if the resulting dynamic
+    /// pressure, force or moment overflows to a nonfinite value.
     pub fn evaluate(&self, body_velocity_m_s: [f64; 3]) -> Result<AeroState, String> {
         self.validate()?;
         if body_velocity_m_s.iter().any(|x| !x.is_finite()) {

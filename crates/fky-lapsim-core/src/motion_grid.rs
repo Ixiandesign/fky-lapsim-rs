@@ -1,4 +1,12 @@
 //! Bounded, deterministic prescribed-motion grids in SI units.
+//!
+//! [MotionGrid] describes a batch of [Motion] samples (one [AxisRange] per commanded
+//! coordinate) compactly enough to save without expanding it; [motion_grid] expands
+//! it into the concrete `Vec<Motion>` that [crate::sweep]/[crate::study::detailed_sweep]
+//! consume. This module is private; its items are re-exported publicly from
+//! [crate::study]. See the "Commanded motion" section of
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md> for
+//! the meaning and units of each coordinate.
 use crate::{Error, Motion};
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +58,15 @@ pub struct MotionGrid {
     pub rack_rear: AxisRange,
 }
 /// Generate up to 10,000 finite motions, validating counts before allocating.
+///
+/// # Errors
+///
+/// Returns an [Error] when: any axis has a non-finite start/end (including a
+/// non-finite `end - start`); any axis has `count == 0` or `count > 10_000`; an axis
+/// has `count == 1` with unequal `start`/`end` (a fixed axis must have equal
+/// endpoints); in [GridMode::Cartesian], the product of all five axis counts exceeds
+/// 10,000; or in [GridMode::Linked], two varying (`count > 1`) axes disagree on their
+/// sample count.
 pub fn motion_grid(g: &MotionGrid) -> Result<Vec<Motion>, Error> {
     let axes = [g.heave, g.roll, g.pitch, g.rack_front, g.rack_rear];
     let fail = |message: &str| Error {

@@ -1,72 +1,121 @@
-//! Pacejka, Tire and Vehicle Dynamics, third edition, §4.3.2.
+//! Pacejka Magic Formula tire force model, *Tire and Vehicle Dynamics*, third
+//! edition, §4.3.2.
 //!
 //! Implements 4.E9–4.E67 and 4.E71–4.E78 at nominal inflation pressure,
 //! unity scaling factors and no turn slip (zeta=1). Inputs are forward-rolling
-//! tire-frame slip coordinates; forces follow the positive-slip convention.
+//! tire-frame slip coordinates; forces follow the positive-slip convention —
+//! the book's Y-right/Z-down frame, not this crate's X-forward/Y-left/Z-up
+//! suspension convention. `tire_configuration::tire_input` converts a
+//! suspension-frame contact velocity/camber into this frame, and the caller
+//! must negate the returned lateral force and moment when converting back.
 //! These coefficients are NOT interchangeable with a0–a17 or the UKY fit.
+//!
+//! This module is the force model consumed by the lap-simulation full-car
+//! vehicle (`crate::lap`). It is a separate concept from the rigid
+//! disk/cylinder/torus contact envelope used by the suspension-only
+//! kinematics model (`Corner::tire_profile`, `tire_radius`, `tire_width` in
+//! `crate::model`) — see the "Rigid tire envelopes" section of
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>.
+//! A bare [`TireModel`] carries no calibration domain or provenance of its
+//! own; `tire_configuration::ConfiguredTire` wraps one with a declared
+//! load/slip/speed domain and required source before a vehicle uses it.
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Exact implemented equation family, serialized with every tire.
+/// Which named Magic Formula equation family a [`TireModel`]'s coefficients
+/// are defined against. Serialized with every tire so a saved coefficient set
+/// can never be silently reinterpreted under a different equation family.
+/// Currently only one family is implemented.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TireFormulation {
-    /// Third-edition §4.3.2, nominal pressure, unity scaling, no turn slip.
+    /// Third-edition §4.3.2, equations 4.E9–4.E67 and 4.E71–4.E78, evaluated
+    /// at nominal inflation pressure, unity scaling factors and no turn slip.
     #[default]
     Pacejka2012NominalPressure,
 }
-/// Named Magic Formula coefficients. Omitted nonessential coefficients are zero;
-/// required shape, peak, stiffness, combined-slip and trail parameters must exist.
+/// A tire's named Magic Formula coefficients, source-traceable to the book's
+/// own coefficient names rather than a generic a0–a17 vector. Omitted
+/// nonessential coefficients default to zero, but the required shape, peak,
+/// stiffness, combined-slip and trail parameters (see [`TireModel::validate`])
+/// must be present and satisfy the book's sign constraints. This type carries
+/// no calibration domain or provenance of its own — a vehicle stores a
+/// `tire_configuration::ConfiguredTire` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TireModel {
-    /// Versioned equation family.
+    /// Equation family these coefficients are defined against.
     #[serde(default)]
     pub formulation: TireFormulation,
-    /// Reference vertical load Fz0, newtons.
+    /// Reference vertical load Fz0 used to normalize load-dependent terms, N.
+    /// Must be finite and strictly positive.
     pub reference_load_n: f64,
-    /// Unloaded radius R0, metres, for moment scaling.
+    /// Unloaded tire radius R0, metres, used to scale the aligning-torque
+    /// terms (pneumatic trail and residual moment). Must be finite and
+    /// strictly positive.
     pub radius_m: f64,
-    /// Uppercase book coefficient names, e.g. PCY1 and PKY4.
+    /// Uppercase book coefficient names (e.g. `PCY1`, `PKY4`) mapped to their
+    /// values. A name outside [`TireModel::coefficient_names`], including a
+    /// legacy `a0`-style name, is rejected by [`TireModel::validate`].
     pub coefficients: BTreeMap<String, f64>,
 }
-/// Tire-frame input. alpha* = tan(alpha), gamma* = sin(gamma).
+/// Tire-frame slip state for one [`TireModel::evaluate`] call, in the book's
+/// Y-right/Z-down convention (not this crate's suspension convention).
+/// alpha* = tan(alpha), gamma* = sin(gamma).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TireInput {
-    /// Positive compression load, N. Zero load produces zero forces.
+    /// Vertical compression load, N. Must be finite and nonnegative; a load
+    /// of exactly zero is not an error and instead produces all-zero forces.
     pub normal_load_n: f64,
-    /// Positive slip angle produces positive lateral force for positive PKY1.
+    /// Slip angle alpha, radians, in the book's sign convention: a positive
+    /// angle produces a positive lateral force for a positive `PKY1`. Must
+    /// satisfy `abs(slip_angle_rad) < pi/2`.
     pub slip_angle_rad: f64,
-    /// (Rolling speed - forward contact speed) / forward contact speed.
+    /// Dimensionless longitudinal slip ratio, (rolling speed - forward
+    /// contact speed) / forward contact speed. Positive under drive torque,
+    /// negative under braking.
     pub slip_ratio: f64,
-    /// Signed tire-frame inclination angle, radians (book convention).
+    /// Signed tire-frame inclination (camber) angle, radians, in the book's
+    /// convention, not this crate's outward-positive suspension camber. Must
+    /// satisfy `abs(camber_rad) < pi/2`.
     pub camber_rad: f64,
-    /// Positive forward tire contact velocity, m/s. Standstill/reverse unsupported.
+    /// Positive forward tire contact velocity, m/s. Must be strictly
+    /// positive; standstill and reverse rolling are unsupported.
     pub speed_m_s: f64,
 }
-/// Computed forces and diagnostics; stiffnesses are with respect to dimensionless slip.
+/// Computed forces, moments and intermediate diagnostics from one
+/// [`TireModel::evaluate`] call, in the book's tire-frame convention.
+/// Stiffnesses are with respect to dimensionless slip, not slip angle in
+/// radians. A zero-load [`TireInput`] returns this type's all-zero
+/// [`Default`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TireForces {
-    /// Combined longitudinal force, N.
+    /// Combined longitudinal force (pure force reduced by the lateral-slip
+    /// weighting), N.
     pub fx_n: f64,
-    /// Combined lateral force, N.
+    /// Combined lateral force (pure force reduced by the longitudinal-slip
+    /// weighting, plus the induced-slip shift), N.
     pub fy_n: f64,
-    /// Combined self-aligning torque, N m.
+    /// Combined self-aligning torque about the contact-patch vertical axis,
+    /// from pneumatic trail, residual moment and the longitudinal force's
+    /// moment arm, N·m.
     pub mz_nm: f64,
     /// Pure longitudinal force before combined-slip weighting, N.
     pub pure_fx_n: f64,
     /// Pure lateral force before combined-slip weighting, N.
     pub pure_fy_n: f64,
-    /// Longitudinal weighting Gxa.
+    /// Longitudinal combined-slip weighting factor Gxa, dimensionless;
+    /// rejected by [`TireModel::evaluate`] if it would be negative.
     pub gx: f64,
-    /// Lateral weighting Gyk.
+    /// Lateral combined-slip weighting factor Gyk, dimensionless; rejected by
+    /// [`TireModel::evaluate`] if it would be negative.
     pub gy: f64,
-    /// Kxk, N per unit longitudinal slip.
+    /// Longitudinal slip stiffness Kxk, N per unit longitudinal slip ratio.
     pub longitudinal_stiffness_n: f64,
-    /// Kya, N per unit tan(alpha).
+    /// Cornering stiffness Kya, N per unit tan(slip angle).
     pub cornering_stiffness_n: f64,
-    /// Lateral friction peak coefficient before shifts.
+    /// Lateral friction peak coefficient mu, before load/camber shifts.
     pub lateral_friction: f64,
     /// Combined-slip pneumatic trail, metres.
     pub pneumatic_trail_m: f64,
@@ -91,12 +140,30 @@ fn phase(b: f64, c: f64, e: f64, x: f64) -> f64 {
 }
 
 impl TireModel {
-    /// Supported named coefficients, in book-family order.
+    /// The full set of coefficient names this formulation recognizes, in the
+    /// book-family grouping order used internally (longitudinal Fx0, lateral
+    /// Fy0, combined-slip weighting, then aligning torque). Any other key in
+    /// [`TireModel::coefficients`], including legacy `a0`-style names, is
+    /// rejected by [`TireModel::validate`].
     pub fn coefficient_names() -> Vec<&'static str> {
         NAMES.split_whitespace().collect()
     }
-    /// Validate model version, dimensions and required coefficients. No fitted
-    /// parameters are invented; unknown names are errors, including legacy a0.
+    /// Validate model dimensions and required coefficients. No fitted
+    /// parameter is invented or defaulted away: every key in
+    /// [`TireModel::coefficients`] must be finite and a recognized name
+    /// (unknown names, including legacy `a0`, are errors), and the
+    /// coefficients that fix the required peak/stiffness/shape must be
+    /// present with the correct sign. [`TireModel::evaluate`] calls this
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `reference_load_n` or `radius_m` is not finite and
+    /// strictly positive; if any coefficient value is nonfinite or its name
+    /// is not one of [`TireModel::coefficient_names`]; if any of `PCX1`,
+    /// `PDX1`, `PKX1`, `PCY1`, `PDY1`, `PKY1`, `PKY2`, `PKY4`, `RBX1`, `RCX1`,
+    /// `RBY1`, `RCY1`, `QBZ1` or `QCZ1` is missing or not strictly positive;
+    /// or if `QDZ1` is missing or negative.
     pub fn validate(&self) -> Result<(), Error> {
         if !self.reference_load_n.is_finite()
             || self.reference_load_n <= 0.
@@ -157,9 +224,24 @@ impl TireModel {
         Ok([fy, k, mu, by, sh, sv])
     }
 
-    /// Evaluate pure/combined forces and aligning torque using named source equations.
-    /// Numerical/physical domain failures return errors; no hidden friction ellipse
-    /// or saturation replaces the specified combined-slip weighting functions.
+    /// Evaluate pure and combined-slip forces and the aligning torque, using
+    /// the named source equations directly (4.E9–4.E67, 4.E71–4.E78).
+    /// Numerical and physical domain failures return errors; no hidden
+    /// friction ellipse or saturation replaces the book's specified
+    /// combined-slip weighting functions. A zero `normal_load_n` is not an
+    /// error and returns [`TireForces::default`] (all zero) directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if [`TireModel::validate`] fails; if any input field
+    /// is nonfinite, `normal_load_n` is negative, `speed_m_s` is not strictly
+    /// positive, or `slip_angle_rad`/`camber_rad` is not within `(-pi/2,
+    /// pi/2)`; if the longitudinal or lateral peak force, stiffness, or
+    /// curvature factor (`E > 1`) is invalid for the given load/camber; if a
+    /// combined-slip weighting function's denominator is degenerate or its
+    /// result would be negative; if the pneumatic-trail stiffness/curvature
+    /// parameters are invalid; or if any resulting force or moment is
+    /// nonfinite.
     pub fn evaluate(&self, input: TireInput) -> Result<TireForces, Error> {
         self.validate()?;
         let TireInput {

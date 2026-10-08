@@ -1,4 +1,26 @@
-//! Bounded, feasibility-first DE with common bounded uncertainty and resumable batches.
+//! Native bounded, feasibility-first differential-evolution optimizer for the
+//! suspension-only model: chassis/corner geometry and spring/damper design variables
+//! ([Variable]/[Relation]) searched against target metrics and hard constraints
+//! ([Target]/[Constraint]) across one or more prescribed-motion scenarios and an optional
+//! ride-dynamics case, under common-random-number bounded uncertainty sampling
+//! ([Perturbation]). The search ([optimize], [OptimizationSession]) runs in-process,
+//! parallelizes candidate evaluation across a bounded rayon worker pool, and is
+//! resumable/checkpointable across pauses (see [OptimizationSession::checkpoint]/
+//! [OptimizationSession::resume]). [candidate_project], [evaluate_candidate], and
+//! [evaluate_validation_candidate] expose the same physics evaluator to external search
+//! algorithms (for example a Python/pymoo/SciPy adapter) without reimplementing it. A
+//! result's [OptimizationResult::best_feasible] is only feasible against the *training*
+//! uncertainty sample; treat a design as sampled-robust only once
+//! [OptimizationResult::status] is `"validated"` and its independent
+//! [OptimizationResult::validation] report is also feasible. No optimizer here guarantees
+//! a global optimum, and no finite sample of an uncertainty distribution proves an entire
+//! continuous region is safe.
+//!
+//! This module implements the search; the Optimization section of the Rust guide is the
+//! spec worth reading alongside it, covering `parameter_registry`/`metric_registry`
+//! addressing, checkpoint/resume semantics, and the `best_feasible`-versus-`"validated"`
+//! distinction in more narrative detail:
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/rust-guide.md#optimization>
 use crate::{CornerId, Error, Motion, Project, RideRequest, RideRun};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +33,10 @@ fn err(s: impl Into<String>) -> Error {
     Error { message: s.into() }
 }
 /// How a [Variable] may range: a bounded continuous value, or a fixed choice among
-/// named enum-like values (see [Variable] for the paths this applies to).
+/// named enum-like values (see [Variable] for the paths this applies to). In a
+/// candidate's `x` slot for this variable, `Continuous` takes any finite value within
+/// `[lower, upper]`, and `Discrete` takes a non-negative integer index into `choices`
+/// (e.g. `1.0` selects `choices[1]`) — see [candidate_project]/[evaluate_candidate].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VariableKind {
@@ -22,24 +47,37 @@ pub enum VariableKind {
         /// Inclusive upper bound.
         upper: f64,
     },
-    /// A discrete choice among named values (only `pushrod_body` and `tire_profile` paths).
+    /// A discrete choice among named values. Only `.../pushrod_body` (choices drawn from
+    /// `"upper_arm"`/`"lower_arm"`/`"knuckle"`) and `.../tire_profile` (choices drawn from
+    /// `"disk"`/`"cylinder"`/`"torus"`) support this; `choices` must be a nonempty,
+    /// duplicate-free subset of the path's own allowed set (at most 3 entries), not an
+    /// arbitrary string list, and is checked against the hardcoded path/choice pairing
+    /// rather than against [parameter_registry] (which only lists numeric leaves).
     Discrete {
         /// Permitted values, e.g. `["upper_arm", "lower_arm", "knuckle"]`.
         choices: Vec<String>,
     },
 }
-/// One design variable: a registered numeric-leaf path (see [parameter_registry]) and
-/// how it may range.
+/// One design variable and how it may range; see [VariableKind]. Every [OptimizationRequest]
+/// must use a distinct `path` across all its variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Variable {
-    /// A path from [parameter_registry].
+    /// For [VariableKind::Continuous], a path from [parameter_registry]. For
+    /// [VariableKind::Discrete], one of the fixed `.../pushrod_body`/`.../tire_profile`
+    /// paths documented on [VariableKind::Discrete] instead (these are not numeric
+    /// leaves, so they are not in [parameter_registry]).
     pub path: String,
     #[serde(flatten)]
     /// Continuous bounds or discrete choices; see [VariableKind].
     pub kind: VariableKind,
 }
 /// A linked coordinate: `destination = source * factor + offset`, applied after a
-/// candidate's independent variables are assigned and after uncertainty perturbation.
+/// candidate's independent variables are assigned and after uncertainty perturbation (so
+/// perturbing a path also perturbs everything it drives through a relation). `source` may
+/// itself be another relation's `destination`; relations are topologically ordered before
+/// application and a cycle is rejected (see `docs/rust-guide.md`'s Optimization section).
+/// The baseline candidate ([OptimizationResult::baseline]) does not apply relations — only
+/// candidates built from [Variable]s do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relation {
     /// A registered path this relation reads from.
@@ -52,97 +90,172 @@ pub struct Relation {
     /// Constant added after multiplying by `factor`.
     pub offset: f64,
 }
-/// How a [Target]'s normalized error is combined across scenarios/uncertainty samples.
+/// How a [Target]'s normalized error is combined across the scenario cases relevant to it
+/// *within one uncertainty sample* (e.g. across [OptimizationRequest::scenarios] when
+/// `values` gives a per-scenario curve). This does not affect how samples themselves are
+/// combined: the per-sample aggregate is always averaged uniformly across every
+/// uncertainty sample (including the nominal case) when forming [Evaluation::contributions].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Aggregation {
-    /// Average of the squared normalized error across all cases.
+    /// Average of the squared normalized error across all relevant cases in the sample.
     MeanSquared,
-    /// The single worst squared normalized error across all cases.
+    /// The single worst (largest) squared normalized error among the sample's relevant cases.
     WorstSquared,
 }
 /// An optimization objective: drive one metric toward a value (or per-scenario values),
 /// weighted and normalized by `scale`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
-    /// Corner this metric is read from; `None` for an axle/vehicle-level metric.
+    /// Corner this metric is read from. Must be `Some(_)` for a per-corner geometry or
+    /// `analysis.*` metric, and `None` for a `"vehicle.*"`, `"ride.*"`, or
+    /// `"project:"`-addressed metric; see [metric_registry] for the full addressing rules.
     pub corner: Option<CornerId>,
-    /// A name from [metric_registry].
+    /// Either a name from [metric_registry] (a geometry/analysis/vehicle/ride metric,
+    /// read from the solved physics), or `"project:<path>"` where `<path>` is a
+    /// [parameter_registry] path, read directly off the constructed candidate project with
+    /// no physics involved (e.g. to hold a hardpoint or spring rate near its original
+    /// value). See [metric_registry] for which form requires which `corner`/`scenarios`/
+    /// `ride_request` combination.
     pub metric: String,
-    /// Desired value, used when `values` is absent (the same target for every scenario).
+    /// Desired value, used when `values` is absent: the same target value applies to
+    /// every scenario, or to the single ride/project-level reading.
     pub value: f64,
-    /// Per-scenario desired values, in scenario order; overrides `value` when present.
+    /// Per-scenario desired values, in [OptimizationRequest::scenarios] order; overrides
+    /// `value` when present. Only valid for a per-corner/vehicle metric with one entry per
+    /// scenario, all finite; a `"ride.*"` or `"project:"` metric has no scenario axis and
+    /// must leave this `None`.
     pub values: Option<Vec<f64>>,
     /// Positive normalization scale, in the metric's own units; the error size that
-    /// counts as one unit of normalized error.
+    /// counts as one unit of normalized error (the raw `(actual - desired)` difference is
+    /// divided by this before squaring, so halving `scale` quadruples this target's
+    /// contribution for the same physical miss).
     pub scale: f64,
     /// Nonnegative weight applied to this target's normalized error relative to others.
+    /// `0` effectively disables the target; at least one target across the whole
+    /// [OptimizationRequest] must have a positive weight.
     pub weight: f64,
-    /// How this target's error is aggregated across scenarios/uncertainty; see [Aggregation].
+    /// How this target's error is aggregated across scenario cases within one uncertainty
+    /// sample; see [Aggregation]. Samples themselves are always averaged.
     pub aggregation: Aggregation,
 }
-/// A hard feasibility limit on one metric: `min <= metric <= max` (either bound optional).
+/// A hard feasibility limit on one metric: `min <= metric <= max` (either bound may be
+/// omitted; leaving both `None` is accepted but never violated). A candidate that violates
+/// this on any case, in any uncertainty sample, is infeasible (see [Evaluation::feasible]).
+/// The violation magnitude accumulated into [Evaluation::violation] for one case is
+/// `max(0, (min - metric) / scale, (metric - max) / scale)` — the normalized distance past
+/// whichever bound is exceeded, and `0` when the case is within bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Constraint {
-    /// Corner this metric is read from; `None` for an axle/vehicle-level metric.
+    /// Corner this metric is read from. Must be `Some(_)` for a per-corner geometry or
+    /// `analysis.*` metric, and `None` for a `"vehicle.*"`, `"ride.*"`, or
+    /// `"project:"`-addressed metric; see [metric_registry] for the full addressing rules.
     pub corner: Option<CornerId>,
-    /// A name from [metric_registry].
+    /// Either a name from [metric_registry], or `"project:<path>"` for a raw
+    /// [parameter_registry] path read directly off the constructed candidate project; see
+    /// the identical addressing rules on [Target::metric]/[metric_registry].
     pub metric: String,
     /// Inclusive lower bound, if any.
     pub min: Option<f64>,
     /// Inclusive upper bound, if any.
     pub max: Option<f64>,
-    /// Positive normalization scale used when reporting violation magnitude.
+    /// Positive normalization scale, in the metric's own units, used only when reporting
+    /// violation magnitude (a constraint is a hard pass/fail; `scale` does not affect
+    /// whether a case is feasible, only how large a violation is reported as).
     pub scale: f64,
 }
-/// Same nonempty factor name shares one uniform latent; unnamed inputs are independent.
+/// One bounded-uniform uncertainty input, added directly to a registered path's nominal
+/// value before any [Relation] is applied (so a relation sourced from this path also
+/// carries the perturbation through). Every perturbation named in one
+/// [OptimizationRequest::uncertainty] list must address a distinct path, and that path
+/// must not also be a [Relation] destination (a relation always overwrites its
+/// destination after perturbation runs, so perturbing a destination directly would have no
+/// effect). Two or more perturbations that share the same nonempty `factor` name draw one
+/// common uniform latent per sample and each scale it by their own `half_range`,
+/// correlating those inputs (e.g. a shared ride-height offset felt at several corners);
+/// perturbations with no `factor`, or distinct factor names, are drawn independently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Perturbation {
     /// A registered path from [parameter_registry] to perturb before each sample.
     pub path: String,
-    /// Bounded-uniform perturbation half-width, in the path's own units; the sampled
-    /// offset lies in `[-half_range, half_range]`.
+    /// Bounded-uniform perturbation half-width, in the path's own units (must be finite
+    /// and `>= 0`); the sampled offset lies in `[-half_range, half_range]`, uniformly.
     pub half_range: f64,
-    /// When set, this perturbation shares one random draw per sample with every other
-    /// perturbation using the same factor name.
+    /// When set to a nonempty name, this perturbation shares one random draw per sample
+    /// (scaled independently by each participant's own `half_range`) with every other
+    /// perturbation using the same factor name; when `None`, this input is sampled
+    /// independently of every other perturbation.
     pub factor: Option<String>,
 }
 /// A complete optimization problem: design variables, objectives/constraints, the
 /// motion/ride cases to evaluate them against, uncertainty sampling, and a search
-/// budget. Passed to [optimize] or [OptimizationSession::start].
+/// budget. Passed to [optimize] or [OptimizationSession::start], both of which validate
+/// it against a [Project] up front (see their `# Errors`). Every collection field here
+/// (`variables`, `relations`, `targets`, `constraints`, `scenarios`, `uncertainty`) is
+/// capped at 128 entries; `training_samples`/`validation_samples` are each capped at 256;
+/// `max_evaluations`/`generations` are each capped at 1,000,000; the serialized project
+/// and this request are each capped in byte size; and the total scheduled physics-case
+/// count (`max_evaluations` times the per-attempt sample counts times the per-sample case
+/// count) is capped as well, so a request that is individually within every field's own
+/// bound can still be rejected for scheduling too much work overall.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizationRequest {
-    /// Design variables; see [Variable].
+    /// Design variables; see [Variable]. Capped at 128 entries; each must address a
+    /// distinct path.
     pub variables: Vec<Variable>,
-    /// Linked coordinates evaluated after variable assignment and uncertainty; see [Relation].
+    /// Linked coordinates evaluated after variable assignment and uncertainty; see
+    /// [Relation]. Capped at 128 entries.
     pub relations: Vec<Relation>,
-    /// Objectives to minimize; see [Target].
+    /// Objectives to minimize; see [Target]. Capped at 128 entries; at least one must
+    /// have a positive `weight`.
     pub targets: Vec<Target>,
-    /// Hard feasibility limits; see [Constraint].
+    /// Hard feasibility limits; see [Constraint]. Capped at 128 entries.
     pub constraints: Vec<Constraint>,
-    /// Prescribed-motion cases every candidate is evaluated against.
+    /// Prescribed-motion cases every candidate is evaluated against. Capped at 128
+    /// entries; may be empty if every [Target]/[Constraint] is `"ride.*"` or
+    /// `"project:"`-addressed (those don't need a scenario).
     pub scenarios: Vec<Motion>,
-    /// An optional ride dynamics case evaluated alongside `scenarios`.
+    /// An optional ride dynamics case evaluated alongside `scenarios`, once per
+    /// uncertainty sample; required when any [Target]/[Constraint] addresses a
+    /// `"ride.*"` metric.
     pub ride_request: Option<RideRequest>,
-    /// Bounded random perturbations applied to the static design before each sample; see [Perturbation].
+    /// Bounded random perturbations applied to the static design before each sample,
+    /// after variables are assigned and before relations run; see [Perturbation]. Capped
+    /// at 128 entries; each must address a distinct path.
     pub uncertainty: Vec<Perturbation>,
-    /// Common-random-number uncertainty samples used while searching (0 disables uncertainty during search).
+    /// Common-random-number uncertainty samples used while searching, in addition to the
+    /// always-included nominal (zero-perturbation) sample; `0` disables uncertainty
+    /// during search (default: `0`). Capped at 256. The same `seed`-derived stream is
+    /// reused for every candidate, so candidates are compared on the same sampled cases.
     pub training_samples: usize,
-    /// Independent held-out uncertainty samples used for final validation.
+    /// Independent held-out uncertainty samples, drawn from a stream distinct from
+    /// `training_samples`, used only for final validation of the search's winning
+    /// candidate (default: `8`). Capped at 256.
     pub validation_samples: usize,
-    /// Deterministic random seed for sampling and search.
+    /// Deterministic random seed for both uncertainty sampling and the differential-
+    /// evolution search itself (default: `1`); the same project and request, run twice
+    /// with the same seed, reproduce the same result.
     pub seed: u64,
-    /// Differential-evolution population size (4..=256).
+    /// Differential-evolution population size, `4..=256` (default: `12`). Ignored (no
+    /// population is built) when every [Variable]'s bounds collapse to a single point.
     pub population_size: usize,
-    /// Target generation count (search may stop earlier on budget exhaustion).
+    /// Target generation count (default: `20`); the search may stop earlier on budget
+    /// exhaustion, cancellation, or because every variable is fixed (bounds collapsed to
+    /// a point), in which case [OptimizationResult::generation] stays `0`. Capped at
+    /// 1,000,000.
     pub generations: usize,
-    /// Hard cap on total candidate evaluations, including final validation.
+    /// Hard cap on total candidate evaluations, including the baseline and final
+    /// recompute/validation attempt (default: `256`). Capped at 1,000,000.
     pub max_evaluations: usize,
-    /// Cooperative active-compute time budget, seconds; checked between physics cases,
-    /// so an in-flight case can finish after the deadline.
+    /// Cooperative active-compute time budget, seconds (default: `60`); checked between
+    /// physics cases, so an in-flight case can finish after the deadline. Must be finite
+    /// and `>= 0`. Time spent paused between [OptimizationSession::advance] calls does
+    /// not count against this.
     pub max_seconds: f64,
-    /// Parallel worker count for the native backend (1..=8).
+    /// Parallel worker count for the native backend, `1..=8` (default: `1`); bounds how
+    /// many population candidates one generation evaluates concurrently (see
+    /// [OptimizationSession::advance]).
     pub workers: usize,
 }
 impl Default for OptimizationRequest {
@@ -172,74 +285,122 @@ impl Default for OptimizationRequest {
 pub struct Failure {
     /// Which uncertainty sample this failure occurred in (0-based).
     pub sample: usize,
-    /// Which case within the sample failed, e.g. a scenario index or "ride".
+    /// The 0-based case index within the sample, as a decimal string (the same indexing
+    /// [Evaluation::case_status] takes as its `case` argument): `"0"` is the
+    /// construction/property check, `"1"` through `"S"` are `scenarios` in order, and
+    /// `"S+1"` is the optional ride case, where `S = scenarios.len()`. Always parses as a
+    /// `usize`; a checkpoint with a `case` that doesn't is rejected on resume.
     pub case: String,
-    /// Human-readable failure reason.
+    /// Human-readable failure reason, e.g. a propagated physics-solve error message or
+    /// `"missing or nonfinite metric"` when the case itself solved but a requested
+    /// target/constraint metric could not be read from it. Multiple diagnostics for the
+    /// same `(sample, case)` are appended into one entry rather than creating duplicates.
     pub reason: String,
 }
 /// The scored result of evaluating one candidate design against a full
 /// [OptimizationRequest]: every scenario, for every uncertainty sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
-    /// Every requested case across every sample finished (whether it succeeded or failed).
+    /// Every requested case across every sample finished (whether it succeeded or failed) —
+    /// nothing was left `NotEvaluated` by a budget or cancellation. A candidate can be
+    /// `feasible` only if it is also `complete`.
     pub complete: bool,
-    /// No constraint violation and no failed physics case.
+    /// Whether this is usable as a design point: `complete`, with no failed case
+    /// (`failed_cases == 0`) and no constraint violation (`violation == 0.0`). `score` is
+    /// `Some` under the same `complete`/no-failed-case condition (modulo the nonfinite-
+    /// aggregate guard on `score`), so a feasible evaluation always has a `score`.
     pub feasible: bool,
-    /// Weighted-aggregated target objective; `None` if incomplete or infeasible.
+    /// Weighted-aggregated target objective: the sum of `contributions`. `None` if
+    /// incomplete, if any case failed, or if the sum came out non-finite (in which case a
+    /// synthetic failure is recorded instead and `feasible` is forced to `false`).
     pub score: Option<f64>,
     /// Per-target normalized-error contribution to `score`, in target order.
     pub contributions: Vec<f64>,
-    /// Target-major values at nominal uncertainty, in scenario order (one for scalar domains).
+    /// Target-major values read at the nominal (zero-perturbation) uncertainty sample
+    /// only, in scenario order for a per-corner/vehicle target, or a single-entry inner
+    /// `Vec` for a `"ride.*"`/`"project:"` target (which has no scenario axis). Only
+    /// populated when the corresponding case was actually reached and its metric found.
     pub nominal_target_values: Vec<Vec<f64>>,
-    /// Number of uncertainty samples evaluated (including the nominal case).
+    /// The number of uncertainty samples this evaluation plans to run, including the
+    /// nominal (zero-perturbation) sample: `1 + training_samples` for a training-scoped
+    /// evaluation, or `1 + validation_samples` for a held-out one (see
+    /// [evaluate_validation_candidate]). Fixed up front; unaffected by an incomplete run
+    /// that stops partway through the plan.
     pub sample_count: usize,
-    /// Number of samples with at least one failed physics case.
+    /// Number of samples with at least one failed case, counting the construction/
+    /// property check and the optional ride case alongside scenario physics.
     pub failed_samples: usize,
     /// Requested cases never reached because of a budget or cancellation.
     pub not_evaluated_cases: usize,
-    /// Total constraint-violation magnitude, summed over samples/constraints, in
-    /// normalized scale units; 0 when feasible.
+    /// Total constraint-violation magnitude, summed over every case and constraint that
+    /// exceeded a bound, in normalized scale units (see [Constraint]'s violation
+    /// formula); exactly `0.0` when no constraint was violated.
     pub violation: f64,
-    /// Total physics cases this evaluation was supposed to run.
+    /// Total physics cases this evaluation was supposed to run:
+    /// `sample_count * (1 + scenarios.len() + has_ride_request)`.
     pub requested_cases: usize,
-    /// Cases actually attempted (succeeded or failed), before any not-evaluated tail.
+    /// Cases actually attempted (succeeded or failed), before any not-evaluated tail;
+    /// includes the construction/property check for every sample.
     pub completed_cases: usize,
-    /// Physics cases that solved successfully.
+    /// Physics cases attempted: a real scenario/ride evaluation was actually issued
+    /// (candidate project valid, case index `> 0`), whether or not it then solved.
+    /// Excludes the construction/property check, which isn't a physics call. The subset
+    /// that failed (either the solve itself errored, or it solved but a requested
+    /// metric came back missing/non-finite) is `physics_cases_failed`.
     pub physics_cases_completed: usize,
-    /// Physics cases that failed to solve.
+    /// The subset of `physics_cases_completed` that failed: either the physics solve
+    /// itself returned an error, or it solved but a target/constraint metric could not be
+    /// read from the result (missing or non-finite). Always `<= physics_cases_completed`.
     pub physics_cases_failed: usize,
-    /// Total failed cases across all samples (mirrors `failed_case_bits`'s set-bit count).
+    /// Total failed cases across all samples, including construction/property-check and
+    /// ride-case failures (mirrors `failed_case_bits`'s set-bit count); always
+    /// `>= physics_cases_failed`.
     pub failed_cases: usize,
-    /// Human-readable detail for failed cases, possibly truncated; see `failures_truncated`.
+    /// Human-readable detail for failed cases, capped at the first 32 recorded; see
+    /// `failures_truncated` for whether more occurred. Prefer `failed_case_bits`/
+    /// `case_status` when every failure's exact location (not its reason text) matters.
     pub failures: Vec<Failure>,
-    /// Whether `failures` omits some failures for size; `failed_case_bits`/`case_status`
-    /// still records every one exactly.
+    /// Whether `failures` omits some failures beyond its 32-entry cap; `failed_case_bits`/
+    /// `case_status` still records every one exactly, just without a reason string.
     pub failures_truncated: bool,
-    /// Compact exact failure mask, including failures whose textual detail was truncated.
+    /// Compact exact failure mask (one bit per case, bit index = `sample * per + case`;
+    /// see [Evaluation::case_status]), including failures whose textual detail was
+    /// truncated out of `failures`.
     pub failed_case_bits: Vec<u64>,
-    /// The largest single squared normalized target residual observed, for diagnosing
-    /// which case drives a `WorstSquared` target.
+    /// The largest single squared normalized target residual observed across every
+    /// target, case, and sample actually reached (regardless of that target's own
+    /// `aggregation`) — useful for diagnosing which sample drives the worst single target
+    /// miss, especially under `WorstSquared`. Does not identify which target; only
+    /// `worst_sample` is recorded alongside it.
     pub worst_squared_residual: f64,
     /// Which uncertainty sample produced `worst_squared_residual`.
     pub worst_sample: usize,
-    /// Ride dynamics model fidelity used, if `ride_request` was set; see [crate::dynamics::MODEL_FIDELITY].
+    /// Ride dynamics model fidelity identifier from the run's [crate::RideRun::model_fidelity]
+    /// (e.g. [crate::dynamics::MODEL_FIDELITY]/[crate::dynamics::COMPONENT_MODEL_FIDELITY]),
+    /// set once this evaluation has completed at least one successful ride case; `None`
+    /// when `ride_request` was not set, or when no ride case has solved yet.
     pub model_fidelity: Option<String>,
 }
 /// The outcome of one physics case within an [Evaluation], from [Evaluation::case_status].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseStatus {
-    /// The case solved successfully.
+    /// The case solved and every target/constraint metric it needed to supply was
+    /// present and finite.
     Success,
-    /// The case failed to solve (invalid/unreachable geometry, contact loss, etc.).
+    /// The case failed: either the physics solve itself failed (invalid/unreachable
+    /// geometry, contact loss, etc.), or it solved but a requested target/constraint
+    /// metric came back missing or non-finite.
     Failure,
     /// The case was never reached (budget exhausted or cancelled first).
     NotEvaluated,
 }
 impl Evaluation {
-    /// Status of one physics case (see [CaseStatus]): case=0 is construction/property
-    /// checks, 1..=S are `scenarios` in order, S+1 is the optional ride case. Returns
-    /// `None` for an out-of-range `sample`/`case`.
+    /// Status of one physics case (see [CaseStatus]): case 0 is the construction/property
+    /// check, `1..=S` are `scenarios` in order, and `S+1` is the optional ride case, where
+    /// `S = scenarios.len()` (the same indexing as [Failure::case], parsed as a `usize`).
+    /// Returns `None` for an out-of-range `sample` (`>= sample_count`) or `case`
+    /// (`>= requested_cases / sample_count`).
     pub fn case_status(&self, sample: usize, case: usize) -> Option<CaseStatus> {
         let per = self.requested_cases.checked_div(self.sample_count)?;
         if sample >= self.sample_count || case >= per {
@@ -274,9 +435,11 @@ impl Evaluation {
 /// its scored [Evaluation].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
-    /// Variable values, in [OptimizationRequest::variables] order.
+    /// Variable values, in [OptimizationRequest::variables] order. Empty for the
+    /// baseline candidate (which has no variables assigned).
     pub values: Vec<f64>,
-    /// Absent when construction or project validation failed.
+    /// The project built from `values` (variables, then relations, no uncertainty);
+    /// absent when construction or [crate::Project::validate] failed for `values`.
     pub project: Option<Project>,
     /// This candidate's scored evaluation.
     pub evaluation: Evaluation,
@@ -285,39 +448,97 @@ pub struct Candidate {
 /// the notable candidates found, and independent validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizationResult {
-    /// Search/validation outcome, e.g. `"validated"`, `"validation_failed"`,
-    /// `"budget_not_validated"`, or `"cancelled"`. Never treat a generic "completed"
-    /// worker status as implying this is `"validated"`.
+    /// Search/validation outcome. One of:
+    /// - `"running"`: only possible from [OptimizationSession::result] mid-search;
+    ///   [optimize] never returns this.
+    /// - `"validated"`: `best_feasible` was recomputed fresh and passed independent
+    ///   held-out validation; see `training_revalidation`/`validation`. This is the only
+    ///   status under which a design should be treated as sampled-robust.
+    /// - `"validation_failed"`: the recomputation completed, but came out infeasible on
+    ///   the training replay, the held-out sample, or both.
+    /// - `"budget_not_validated"`: `max_evaluations`/`max_seconds` ran out before the
+    ///   final recompute-and-validate attempt could complete.
+    /// - `"cancelled_not_validated"`: the caller's cancellation token was set before that
+    ///   attempt could complete.
+    /// - `"no_feasible_candidate"`: the baseline ran, but the search never found a
+    ///   feasible candidate to validate in the first place.
+    ///
+    /// Never treat a generic "completed" worker status (from whatever orchestrates this
+    /// optimizer, e.g. a job queue) as implying this is `"validated"` — check this field
+    /// itself.
     pub status: String,
-    /// The original input project, evaluated as a candidate for comparison.
+    /// The original input project, evaluated as a candidate for comparison, with no
+    /// [Variable]s assigned and no [Relation]s applied (so `values` is empty). Bounded
+    /// [Perturbation]s are still applied to it if `uncertainty` is configured. Compare to
+    /// the first initial-population candidate, which starts from this same project's
+    /// current values (clamped to each variable's bounds) but *does* apply relations.
     pub baseline: Option<Candidate>,
-    /// The best feasible candidate found, after fresh training recomputation.
+    /// The population search's best feasible candidate, replaced during final validation
+    /// by a fresh recomputation of that same design (see `training_revalidation`).
+    /// Becomes `None` if that fresh recomputation turns out infeasible — a design that
+    /// only looked feasible while training is never returned here.
     pub best_feasible: Option<Candidate>,
-    /// The best infeasible candidate found, if no feasible candidate was found.
+    /// The best infeasible candidate seen during the population search (see
+    /// [Evaluation::better_than]'s infeasible-pair ordering), tracked even while a
+    /// feasible candidate also exists. Meaningful as the reported answer only when
+    /// `best_feasible` ends up `None`. If a feasible candidate was found but its fresh
+    /// `training_revalidation` turned out infeasible, this field is overwritten with that
+    /// fresh (infeasible) recomputation, replacing whatever the search itself had tracked.
     pub best_infeasible: Option<Candidate>,
-    /// `best_feasible` re-evaluated against independent held-out uncertainty samples.
+    /// `best_feasible`'s design, re-evaluated against independent held-out uncertainty
+    /// samples ([OptimizationRequest::validation_samples]) in the same reserved final
+    /// attempt as `training_revalidation`. `Some` exactly when `validation_attempts == 1`.
     pub validation: Option<Evaluation>,
-    /// `best_feasible` re-evaluated once more against a fresh sample of the training
-    /// distribution, guarding against a search that merely overfit its training samples.
+    /// `best_feasible`'s design, re-evaluated once more against a fresh sample of the
+    /// training distribution, guarding against a search that merely overfit its training
+    /// samples (rather than reusing the cached training-time score). Set together with
+    /// `validation` in the same reserved final attempt; if this comes back infeasible,
+    /// `best_feasible` is cleared to `None` and `best_infeasible` takes this recomputation.
     pub training_revalidation: Option<Evaluation>,
-    /// Total candidate evaluations across baseline, search, and validation.
+    /// Total candidate evaluations across baseline, search, and validation:
+    /// `baseline_attempts + search_attempts + validation_attempts`.
     pub candidate_attempts: usize,
-    /// Candidate evaluations spent on the baseline.
+    /// Candidate evaluations spent on the baseline: `0` or `1`.
     pub baseline_attempts: usize,
-    /// Candidate evaluations spent on the population search.
+    /// Candidate evaluations spent on the population search (initial population plus
+    /// every differential-evolution trial).
     pub search_attempts: usize,
-    /// Candidate evaluations spent on final training-recompute and held-out validation.
+    /// Candidate evaluations spent on the reserved final attempt: `0` (not yet reached,
+    /// or no feasible candidate to validate) or `1` — that single attempt performs both a
+    /// training recomputation and an independent held-out validation, but is counted once.
     pub validation_attempts: usize,
-    /// Total individual physics cases that solved successfully, across all attempts.
+    /// Total physics cases attempted across every candidate evaluation so far (baseline,
+    /// search, and validation), whether or not they then solved — see
+    /// [Evaluation::physics_cases_completed] for exactly what counts as "attempted".
     pub physics_cases_completed: usize,
-    /// Total individual physics cases that failed to solve, across all attempts.
+    /// Total physics cases, across every candidate evaluation so far, whose solve failed
+    /// or whose result was missing a requested target/constraint metric — see
+    /// [Evaluation::physics_cases_failed].
     pub physics_cases_failed: usize,
-    /// Generations completed before the search stopped.
+    /// Generations completed before the search stopped; at most
+    /// [OptimizationRequest::generations]. Stays `0` if every [Variable]'s bounds
+    /// collapsed to a single point (no population evolves in that case; see
+    /// [OptimizationRequest::population_size]).
     pub generation: usize,
-    /// Cooperative active-compute time actually spent, seconds (paused time excluded).
+    /// Cooperative active-compute time actually spent across every
+    /// [OptimizationSession::advance] call so far, seconds; time spent paused between
+    /// calls is excluded, and is not charged against [OptimizationRequest::max_seconds].
     pub elapsed_seconds: f64,
 }
-/// Explicit numeric-leaf whitelist; optional numeric leaves must already exist.
+/// Every JSON Pointer path in `p` addressing a numeric leaf that a
+/// [VariableKind::Continuous] [Variable], a [Relation], or a [Perturbation] may
+/// reference, and that a `"project:<path>"` [Target]/[Constraint] metric may read (see
+/// [metric_registry]). Always includes chassis mass/inertia and every corner's
+/// hardpoints, tire envelope, and spring/damper law. Optional per-corner fields
+/// (`min_length_m`/`max_length_m`, the heave/roll interconnect arm hardpoints, and
+/// component masses) and the front/rear [crate::AxleInterconnect] spring/damper paths are
+/// included only when the corresponding optional value is already configured on `p`: an
+/// optimization cannot introduce an absent optional leaf that isn't there to begin with.
+///
+/// Discrete choice fields (`pushrod_body`, `tire_profile`) are addressed through
+/// [VariableKind::Discrete] against a separate, fixed set of permitted paths and choices,
+/// not through this registry — they hold string values, not numbers, so they cannot be a
+/// [Relation] endpoint or a [Perturbation] target either.
 pub fn parameter_registry(p: &Project) -> Vec<String> {
     let mut out = vec!["/chassis/sprung_mass".into()];
     for field in ["center_of_mass", "inertia"] {
@@ -421,10 +642,20 @@ pub fn parameter_registry(p: &Project) -> Vec<String> {
     }
     out
 }
-/// Names of every metric a [Target]/[Constraint] may reference: every field of
-/// [crate::Metrics] (geometry, read per-corner), plus ride-summary, analysis-gradient,
-/// and vehicle-level names (read axle-wide or vehicle-wide; see [crate::Corner] for
-/// what `corner: None` means for those).
+/// Metric names usable directly (unprefixed) by a [Target]/[Constraint]: every field of
+/// [crate::Metrics] (per-corner alignment/rest-length geometry — requires `corner:
+/// Some(_)` and at least one [OptimizationRequest::scenarios] entry), the `analysis.*`
+/// per-corner gradient metrics from [crate::analyze] (also `corner: Some(_)`, nonempty
+/// `scenarios`), the `vehicle.*` axle/vehicle-level metrics from [crate::analyze]
+/// (`corner: None`, nonempty `scenarios`), and the `ride.*` summary metrics from
+/// [ride_summary] (`corner: None`, requires a configured
+/// [OptimizationRequest::ride_request]).
+///
+/// A separate, unregistered addressing form exists alongside these: a metric named
+/// `"project:<path>"`, where `<path>` is any [parameter_registry] path, reads that path
+/// directly off the constructed candidate project with no physics involved, and also
+/// requires `corner: None`. See `docs/rust-guide.md`'s Optimization section for how these
+/// combine with `corner`/`scenarios`/`ride_request`.
 pub fn metric_registry() -> Vec<String> {
     let mut m: Vec<String> = serde_json::to_value(crate::Metrics::default())
         .unwrap()
@@ -722,8 +953,25 @@ fn samples(r: &OptimizationRequest, validation: bool) -> Vec<Vec<f64>> {
     out
 }
 /// Summarize a complete (untruncated) [RideRun] of exactly `duration` seconds into the
-/// scalar `ride.*` metrics from [metric_registry]. Errs if the run terminated early,
-/// doesn't span `duration`, or produced a nonfinite sample.
+/// scalar `ride.*` metrics from [metric_registry]: RMS heave acceleration, peak
+/// heave/roll/pitch magnitude, and peak shock speed/force magnitude across all four
+/// corners. Used internally by the optimizer whenever [OptimizationRequest::ride_request]
+/// is set, and usable directly by callers building their own ride objective outside it.
+///
+/// # Errors
+/// Returns an error if:
+/// - `run` carries a [crate::RideTermination] (it stopped early on a physical/model-
+///   validity event rather than running to completion);
+/// - `duration` is not finite or is `<= 0`, or `run`'s last sample time does not match it
+///   within a `1e-9 * duration` relative tolerance — i.e. `run` does not span exactly
+///   `duration` seconds;
+/// - `run` has fewer than two samples, or its first sample's time is not exactly zero;
+/// - any two consecutive samples have a non-finite or non-positive time step;
+/// - any computed summary value, or any field of any sample, is non-finite. This is
+///   detected by re-serializing each sample and checking for a JSON `null`, which is how
+///   `serde_json` represents a non-finite `f64`; an absent optional field (e.g. no
+///   configured axle interconnect) is omitted by the sample's own serde attributes rather
+///   than serialized as `null`, so this does not false-positive on those.
 pub fn ride_summary(
     run: &RideRun,
     duration: f64,
@@ -798,8 +1046,54 @@ fn stopped(token: Option<&AtomicBool>, start: Instant, seconds: f64) -> bool {
     token.is_some_and(|t| t.load(Ordering::Relaxed)) || start.elapsed().as_secs_f64() >= seconds
 }
 /// Evaluate one candidate's variable values `x` (in [OptimizationRequest::variables]
-/// order) against `r`'s full scenario/ride/uncertainty set, without cancellation or a
-/// stop callback. See [evaluate_candidate_controlled] to pass those.
+/// order) against `r`'s full scenario/ride set, using its training uncertainty stream
+/// (the nominal case plus [OptimizationRequest::training_samples] samples; `0` disables
+/// uncertainty). No cancellation or stop callback; see [evaluate_candidate_controlled] to
+/// pass those, or [evaluate_validation_candidate] to evaluate against the independent
+/// held-out stream instead.
+///
+/// # Examples
+/// ```
+/// use fky_lapsim_core::optimize::{
+///     evaluate_candidate, Aggregation, OptimizationRequest, Target, Variable, VariableKind,
+/// };
+/// use fky_lapsim_core::Project;
+///
+/// let project = Project::example();
+/// let request = OptimizationRequest {
+///     variables: vec![Variable {
+///         path: "/corners/0/shock_chassis/1".into(),
+///         kind: VariableKind::Continuous { lower: 0.05, upper: 0.25 },
+///     }],
+///     // A "project:" target reads the constructed project directly, with no physics.
+///     targets: vec![Target {
+///         corner: None,
+///         metric: "project:/corners/0/shock_chassis/1".into(),
+///         value: 0.21,
+///         values: None,
+///         scale: 1.,
+///         weight: 1.,
+///         aggregation: Aggregation::MeanSquared,
+///     }],
+///     ..Default::default()
+/// };
+/// // One candidate, no search: just score `x` against the request's targets.
+/// let evaluation = evaluate_candidate(&project, &request, &[0.15])?;
+/// assert!(evaluation.feasible);
+/// assert!((evaluation.score.unwrap() - 0.0036).abs() < 1e-9); // ((0.15 - 0.21) / 1.0)^2
+/// # Ok::<(), fky_lapsim_core::Error>(())
+/// ```
+///
+/// # Errors
+/// Returns an error only if `r` itself is invalid: a [Variable]/[Relation]/[Perturbation]
+/// path outside [parameter_registry], a malformed continuous/discrete bound or duplicate
+/// variable, a relation cycle, a [Target]/[Constraint] `metric`/`corner` combination that
+/// fails [metric_registry]'s addressing rules, a non-positive `scale`, a negative
+/// `weight`, no target with positive weight, or a size/scheduled-work-count limit (see
+/// [OptimizationRequest]'s field docs). A bad `x` (wrong length, a value outside its
+/// variable's bounds, or one that builds an invalid [Project]) is never an `Err` here —
+/// it is instead reported inside the returned [Evaluation] as an incomplete/infeasible
+/// result with a recorded [Failure] (see [Evaluation::feasible], [Evaluation::failures]).
 pub fn evaluate_candidate(
     p: &Project,
     r: &OptimizationRequest,
@@ -807,8 +1101,18 @@ pub fn evaluate_candidate(
 ) -> Result<Evaluation, Error> {
     evaluate_candidate_controlled(p, r, x, false, &|| false)
 }
-/// Independent held-out stream, including nominal. Costs one candidate bundle;
-/// the caller owns cumulative external-algorithm accounting. No implicit training replay.
+/// Evaluate `x` against `r`'s independent held-out uncertainty stream (the nominal case
+/// plus [OptimizationRequest::validation_samples] samples), with no cooperative stop
+/// callback beyond `r.max_seconds`. This single call is one candidate bundle of physics
+/// cases; it performs no implicit replay of whatever training evaluation produced `x`
+/// (compare [OptimizationSession]'s own final phase, which runs both a training
+/// recomputation and this held-out evaluation together). An external search algorithm
+/// calling this repeatedly owns and must track its own cumulative evaluation-count and
+/// time budget across calls.
+///
+/// # Errors
+/// Returns an error only if `r` itself is invalid (see [evaluate_candidate]'s `# Errors`);
+/// a bad `x` is reported inside the returned [Evaluation], never as an `Err`.
 pub fn evaluate_validation_candidate(
     p: &Project,
     r: &OptimizationRequest,
@@ -816,7 +1120,19 @@ pub fn evaluate_validation_candidate(
 ) -> Result<Evaluation, Error> {
     evaluate_candidate_controlled(p, r, x, true, &|| false)
 }
-/// Construct the nominal realized project (variables, then relations). No physics work.
+/// Construct the nominal realized project for `x`: assign `r.variables` then apply
+/// `r.relations`, with no uncertainty perturbation and no physics work. Useful for
+/// inspecting or exporting what a candidate's design actually looks like, independent of
+/// scoring it.
+///
+/// # Errors
+/// Returns an error if `r` itself is invalid (see [evaluate_candidate]'s `# Errors`), if
+/// `x`'s length does not match `r.variables`, if any continuous value in `x` is
+/// non-finite or outside its variable's bounds (or, for a discrete variable, not a valid
+/// non-negative integer choice index), or if the resulting project fails
+/// [crate::Project::validate]. Unlike [evaluate_candidate], a bad `x` here **is** an
+/// `Err`: this function does no physics evaluation and has no [Evaluation] to report
+/// failure through.
 pub fn candidate_project(
     p: &Project,
     r: &OptimizationRequest,
@@ -825,9 +1141,21 @@ pub fn candidate_project(
     validate(p, r)?;
     construct(p, r, x, &vec![0.; r.uncertainty.len()])
 }
-/// One candidate attempt with per-call max_seconds and cooperative stop at each case.
-/// Zero max_evaluations permits no work. Positive max_evaluations does not create a
-/// shared external budget; adapters must count calls themselves. stop must be thread safe.
+/// One externally-controlled candidate attempt: evaluates `x` against `r`'s training
+/// uncertainty stream (`validation = false`) or its independent held-out stream
+/// (`validation = true`; see [OptimizationRequest::training_samples]/`validation_samples`).
+/// Applies both `r.max_seconds` (timed from this call's own start) and the caller's
+/// `stop` callback, checked cooperatively between physics cases — never mid-solve;
+/// either one ends the attempt early with an incomplete [Evaluation], not an `Err`. A
+/// zero `r.max_evaluations` permits no work at all: the very first case is never
+/// reached. A positive `r.max_evaluations` is *not* a shared budget enforced across
+/// calls — an adapter calling this repeatedly (e.g. from a Python/pymoo/SciPy search)
+/// owns and must enforce its own cumulative evaluation count; only `max_seconds`/`stop`
+/// are enforced per call. `stop` must be safe to call from another thread.
+///
+/// # Errors
+/// Returns an error only if `r` itself is invalid (see [evaluate_candidate]'s `# Errors`);
+/// a bad `x` is reported inside the returned [Evaluation], never as an `Err`.
 pub fn evaluate_candidate_controlled(
     p: &Project,
     r: &OptimizationRequest,
@@ -1214,7 +1542,73 @@ fn check_persisted_evaluation(
     }
     Ok(())
 }
-/// Checkpoint includes precomputed generation trials and completed results; pauses consume no time.
+/// Interactive, resumable handle on one optimization run: [OptimizationSession::start] it,
+/// drive it forward in bounded increments with
+/// [OptimizationSession::advance] (checking [OptimizationSession::result]/
+/// [OptimizationSession::is_finished] between calls), and optionally serialize it with
+/// [OptimizationSession::checkpoint] to [OptimizationSession::resume] later — in another
+/// process, after a restart, or simply after a pause, since paused time is never charged
+/// against [OptimizationRequest::max_seconds]. [optimize] is a blocking convenience that
+/// drives a session to completion in one call; use this type directly for interactive
+/// progress reporting, cooperative cancellation, or checkpointing across restarts.
+///
+/// A checkpoint captures the session's complete internal state, including any
+/// partially-completed generation of trials and every candidate/evaluation computed so
+/// far, and is checksummed so a corrupted or hand-edited checkpoint is rejected by
+/// [OptimizationSession::resume] rather than silently trusted.
+///
+/// # Examples
+/// A minimal interactive run: start, advance a few candidate attempts, checkpoint
+/// mid-search, resume from that checkpoint against the identical project/request
+/// (as required by [OptimizationSession::resume]), and drive it to completion.
+///
+/// This example is marked `no_run`: it type-checks but is not executed as part
+/// of the test suite, because even a small population/generation search is
+/// heavy enough (real parallel physics evaluations, not a mock) that running
+/// it on a doctest's constrained default stack is unreliable — the equivalent
+/// scenario is exercised as a normal `#[test]` in `tests/optimize.rs`
+/// (`resume_mid_generation`), which runs on a thread with a larger stack.
+/// ```no_run
+/// use fky_lapsim_core::optimize::{
+///     Aggregation, OptimizationRequest, OptimizationSession, Target, Variable, VariableKind,
+/// };
+/// use fky_lapsim_core::Project;
+///
+/// let project = Project::example();
+/// let request = OptimizationRequest {
+///     variables: vec![Variable {
+///         path: "/corners/0/shock_chassis/1".into(),
+///         kind: VariableKind::Continuous { lower: 0.05, upper: 0.25 },
+///     }],
+///     targets: vec![Target {
+///         corner: None,
+///         metric: "project:/corners/0/shock_chassis/1".into(),
+///         value: 0.21,
+///         values: None,
+///         scale: 1.,
+///         weight: 1.,
+///         aggregation: Aggregation::MeanSquared,
+///     }],
+///     max_evaluations: 100,
+///     generations: 12,
+///     population_size: 6,
+///     ..Default::default()
+/// };
+///
+/// let mut session = OptimizationSession::start(&project, &request)?;
+/// session.advance(4, None)?;
+/// let checkpoint = session.checkpoint()?; // e.g. persist this string somewhere
+///
+/// // ...later, possibly in a different process, with the same project/request:
+/// let mut resumed = OptimizationSession::resume(&project, &request, &checkpoint)?;
+/// while !resumed.is_finished() {
+///     resumed.advance(3, None)?;
+/// }
+/// let result = resumed.result();
+/// assert_eq!(result.status, "validated");
+/// assert!(result.best_feasible.unwrap().evaluation.score.unwrap() < 1e-6);
+/// # Ok::<(), fky_lapsim_core::Error>(())
+/// ```
 pub struct OptimizationSession {
     state: SessionState,
 }
@@ -1258,8 +1652,16 @@ fn base_values(p: &Project, r: &OptimizationRequest) -> Vec<f64> {
         .collect()
 }
 impl OptimizationSession {
-    /// Begin a new session for `r` against `p`. Validates `r` (bounds, registry
-    /// membership, size limits) before returning.
+    /// Begin a new session for `r` against `p`, ready for [Self::advance]. Starts in the
+    /// `"baseline"` phase with `result().status == "running"` and no attempts spent yet;
+    /// the first [Self::advance] call evaluates `p` itself (see
+    /// [OptimizationResult::baseline]) before generating the initial population.
+    ///
+    /// # Errors
+    /// Validates `r` against `p` up front (bounds, [parameter_registry]/[metric_registry]
+    /// membership, relation cycles, and size/scheduled-work-count limits) and returns an
+    /// error if it is invalid, for the same reasons documented on [evaluate_candidate]'s
+    /// `# Errors`. No physics is evaluated by this call.
     pub fn start(p: &Project, r: &OptimizationRequest) -> Result<Self, Error> {
         validate(p, r)?;
         Ok(Self {
@@ -1293,24 +1695,58 @@ impl OptimizationSession {
         })
     }
     /// The current (possibly partial) [OptimizationResult]; call after [Self::advance]
-    /// to see progress, or once [Self::is_finished] to get the final result.
+    /// to see progress, or once [Self::is_finished] to get the final result. Clones the
+    /// whole result (including any [Candidate]'s [Project]) on every call.
     pub fn result(&self) -> OptimizationResult {
         self.state.result.clone()
     }
-    /// Whether the session has reached a terminal phase (validated, failed, or cancelled).
+    /// Whether the session has reached its terminal `"done"` phase: `result().status` is
+    /// then one of the terminal values documented on [OptimizationResult::status] (never
+    /// `"running"`). [Self::advance] is a no-op once this is true.
     pub fn is_finished(&self) -> bool {
         self.state.phase == "done"
     }
     /// Serialize this session's full internal state, including precomputed generation
     /// trials and completed results, for later [Self::resume]. Checksummed against
     /// corruption; pauses between `checkpoint`/`resume` consume no active-time budget.
+    ///
+    /// # Errors
+    /// Returns an error only if serializing the session's internal state to JSON fails;
+    /// this is not expected to occur for a session built through [Self::start],
+    /// [Self::resume], and [Self::advance].
     pub fn checkpoint(&self) -> Result<String, Error> {
         let payload = serde_json::to_string(&self.state).map_err(|e| err(e.to_string()))?;
         serde_json::to_string(&(checksum(&payload), payload)).map_err(|e| err(e.to_string()))
     }
-    /// Resume a session from a [Self::checkpoint] string. `p` and `r` must exactly match
-    /// the project/request the checkpoint was created with; the checkpoint's own
-    /// consistency (checksum, phase, recorded identity) is re-validated on resume.
+    /// Resume a session from a [Self::checkpoint] string produced by *this* `p`/`r`
+    /// pair. Re-derives the checkpoint's stored identity hash from `p`/`r` and rejects
+    /// any mismatch, so resuming against a changed project or request (different
+    /// variables, bounds, targets, budgets, seed, etc.) is always rejected rather than
+    /// silently continuing with different inputs than the checkpoint was built against.
+    /// The checksum, phase, attempt-accounting, and every persisted [Evaluation]/
+    /// [Candidate]/pending trial are also cross-checked for internal consistency, so a
+    /// corrupted or hand-edited checkpoint is rejected rather than trusted.
+    ///
+    /// This validation is structural, not a full physics recomputation: a persisted
+    /// candidate's cached score is trusted for in-progress search bookkeeping as long as
+    /// it is internally self-consistent, but the session's own final answer is always
+    /// freshly recomputed from the winning candidate's `values` once the search reaches
+    /// its validation phase (see [OptimizationResult::training_revalidation]) — so a
+    /// tampered intermediate checkpoint cannot forge the eventual reported result, only
+    /// waste a mid-search comparison.
+    ///
+    /// # Errors
+    /// Returns an error if: `r` itself is invalid (see [evaluate_candidate]'s `# Errors`);
+    /// `json` exceeds its 256,000,000-byte size limit, fails to deserialize, or its
+    /// checksum does not match its payload; the checkpoint's recorded identity does not match
+    /// `p`/`r`, or its phase/attempt counters/population sizes are out of range for `r`;
+    /// its attempt accounting, baseline/validation presence, or best-candidate
+    /// feasibility flags are mutually inconsistent; a persisted evaluation, candidate
+    /// project, or pending trial fails its own structural checks (size, finiteness,
+    /// bounds, score-vs-contributions, failure-mask consistency); or, for a checkpoint
+    /// already in its terminal `"done"` phase, the recorded `status` is not actually
+    /// supported by the recorded baseline/`training_revalidation`/`validation`/
+    /// `best_feasible` evidence.
     pub fn resume(p: &Project, r: &OptimizationRequest, json: &str) -> Result<Self, Error> {
         validate(p, r)?;
         if json.len() > 256_000_000 {
@@ -1574,8 +2010,41 @@ impl OptimizationSession {
         }
         s.phase = "evolution".into();
     }
-    /// Executes at most max_work candidate attempts. Cancellation/deadline checked between cases;
-    /// an individual native ride/geometry solve cannot be interrupted. Private pool capped at 8.
+    /// Executes at most `max_work` candidate attempts — the baseline and each
+    /// initial-population member or differential-evolution trial count one apiece against
+    /// this limit — advancing the session through its `"baseline"` -> `"initial"` ->
+    /// `"evolution"` -> `"validation"` -> `"done"` phases. Returns the
+    /// [OptimizationResult] snapshot as of when this call stops, whether or not the
+    /// session finished. Population-candidate evaluations within one generation run in
+    /// parallel on a private thread pool sized to the smaller of
+    /// [OptimizationRequest::workers] and the machine's available parallelism, bounded
+    /// further by however much of `max_work` remains in this call.
+    ///
+    /// The reserved final recompute-and-validate attempt is different: reaching the
+    /// `"validation"` phase with at least one unit of `max_work` left always runs it to
+    /// completion (or to whatever the deadline/cancellation allows) within this same
+    /// call — it is never split across calls, and does not itself consume any of
+    /// `max_work`'s count, though it still counts once against
+    /// [OptimizationResult::candidate_attempts]/`validation_attempts` and against the
+    /// active deadline.
+    ///
+    /// Cancellation and the active deadline are checked cooperatively between physics
+    /// cases, never during one; an in-flight native geometry/ride solve always finishes.
+    /// `cancel`, if given, is a shared flag an external thread may set at any time to
+    /// request an early, unvalidated stop. The deadline is
+    /// [OptimizationRequest::max_seconds], measured across every `advance` call on this
+    /// session since [Self::start]/[Self::resume] (via [OptimizationResult::elapsed_seconds]),
+    /// excluding time spent paused between calls. Either cause ends the session, if it
+    /// had not already reached a natural terminal state, as `"budget_not_validated"` or
+    /// `"cancelled_not_validated"` rather than `"validated"` — including when the cause
+    /// fires partway through the final recompute-and-validate attempt itself.
+    ///
+    /// # Errors
+    /// Returns an error only if building the private rayon thread pool used to
+    /// parallelize a batch of population-candidate evaluations fails (for example, if the
+    /// OS refuses to create new threads); the baseline and final validation attempts run
+    /// single-threaded and cannot fail this way. `r` was already validated by
+    /// [Self::start]/[Self::resume], so an invalid request is not a source of error here.
     pub fn advance(
         &mut self,
         max_work: usize,
@@ -1765,7 +2234,47 @@ impl OptimizationSession {
 /// Run a complete native optimization to completion: baseline, budgeted population
 /// search, best-candidate recomputation, and independent held-out validation. A
 /// blocking convenience over [OptimizationSession]; use the session directly for
-/// interactive progress, cancellation, or checkpointing.
+/// interactive progress, cooperative cancellation, or checkpointing across pauses.
+///
+/// # Examples
+/// ```
+/// use fky_lapsim_core::optimize::{
+///     optimize, Aggregation, OptimizationRequest, Target, Variable, VariableKind,
+/// };
+/// use fky_lapsim_core::Project;
+///
+/// let project = Project::example();
+/// let request = OptimizationRequest {
+///     variables: vec![Variable {
+///         path: "/corners/0/shock_chassis/1".into(),
+///         kind: VariableKind::Continuous { lower: 0.05, upper: 0.25 },
+///     }],
+///     targets: vec![Target {
+///         corner: None,
+///         metric: "project:/corners/0/shock_chassis/1".into(),
+///         value: 0.21,
+///         values: None,
+///         scale: 1.,
+///         weight: 1.,
+///         aggregation: Aggregation::MeanSquared,
+///     }],
+///     max_evaluations: 100,
+///     generations: 12,
+///     population_size: 6,
+///     ..Default::default()
+/// };
+/// let result = optimize(&project, &request)?;
+/// // Only "validated" means the winner is backed by independent held-out validation,
+/// // not merely a low score against the training uncertainty sample.
+/// assert_eq!(result.status, "validated");
+/// assert!(result.best_feasible.unwrap().evaluation.score.unwrap() < 1e-6);
+/// # Ok::<(), fky_lapsim_core::Error>(())
+/// ```
+///
+/// # Errors
+/// Returns an error if `r` is invalid for `p` (see [evaluate_candidate]'s `# Errors`, via
+/// [OptimizationSession::start]), or if building a parallel worker pool for a batch of
+/// candidate evaluations fails (see [OptimizationSession::advance]'s `# Errors`).
 pub fn optimize(p: &Project, r: &OptimizationRequest) -> Result<OptimizationResult, Error> {
     let mut s = OptimizationSession::start(p, r)?;
     while !s.is_finished() {

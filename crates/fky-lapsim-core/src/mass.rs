@@ -1,26 +1,63 @@
-//! Rigid component inertia on seven holonomic coordinates.
+//! Rigid component inertia on seven holonomic coordinates: `x = [heave, roll, pitch,
+//! z_fl, z_fr, z_rl, z_rr]`, i.e. [crate::Motion]'s heave/roll/pitch followed by each
+//! corner's prescribed road (tire support point) height (in `Project.corners` order),
+//! matching the `road_heights` argument of `crate::study::simulate_on_road_tolerance`.
+//! This module is internal: it supplies [RideMode::RetainedComponentInertia](crate::RideMode::RetainedComponentInertia)'s
+//! generalized mass matrix, gravity generalized force, velocity-product (Christoffel)
+//! bias force, and potential energy for whichever of each corner's `component_masses`
+//! (upper arm, lower arm, knuckle, rocker) carry positive mass; see
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md> for
+//! the underlying coordinate/sign conventions and the "Component mass and inertia"
+//! section of `docs/rust-guide.md` for how a caller selects this mode.
 use crate::Error;
 use nalgebra::{Matrix3, SMatrix, SVector, UnitQuaternion, Vector3};
+/// The 7 generalized coordinates: heave, roll, pitch, then 4 per-corner prescribed
+/// road (tire support point) heights, in that order.
 pub(crate) type X = SVector<f64, 7>;
+/// A 7-by-7 generalized mass matrix over [X].
 pub(crate) type M = SMatrix<f64, 7, 7>;
+/// A 3-by-7 Jacobian of a 3-vector (position or angular velocity) with respect to [X].
 type J = SMatrix<f64, 3, 7>;
+/// One retained rigid body's mass, inertia, and pose at a given generalized
+/// coordinate, as produced by [poses].
 #[derive(Clone)]
 pub(crate) struct BodyPose {
+    /// Mass, kilograms; always positive (zero-mass bodies are filtered out earlier).
     pub mass: f64,
+    /// Inertia about the body's center of mass, in the body's own (unrotated) axes,
+    /// kg m².
     pub inertia: Matrix3<f64>,
+    /// World-frame center-of-mass position, metres.
     pub position: Vector3<f64>,
+    /// World-frame orientation relating body axes to world axes.
     pub rotation: UnitQuaternion<f64>,
+    /// Index into `Project.corners` this body belongs to, when it is a per-corner
+    /// link; `None` for a body (if any) not tied to a single corner.
     pub corner: Option<usize>,
 }
+/// The generalized-coordinate terms [terms] assembles from the retained bodies: the
+/// mass matrix, gravity and velocity-product generalized forces, and potential
+/// energy, each a function of the coordinate `x` (and, for `bias`, the generalized
+/// velocity `w`) passed to [terms].
 #[derive(Clone)]
 pub(crate) struct Terms {
+    /// Generalized mass matrix `M(x)`.
     pub mass: M,
+    /// Generalized gravity term `dV/dx` (the potential-energy gradient, `potential`
+    /// below); callers subtract it, along with `bias`, from the generalized applied
+    /// force before solving for acceleration (`M*qddot = Q_ext - gravity - bias`).
     pub gravity: X,
+    /// Velocity-product (Christoffel/Coriolis) generalized bias force at `(x, w)`.
     pub bias: X,
+    /// Total gravitational potential energy of the retained bodies at `x`, joules.
     pub potential: f64,
     jacobians: Vec<(J, J)>,
 }
 impl Terms {
+    /// True when this instance's and `finer`'s body-position/orientation-rate
+    /// Jacobians agree to within `1e-5 + 2e-4 * |value|`, used to check that the
+    /// central-difference step size is small enough for the reported terms to be
+    /// trustworthy.
     pub(crate) fn stable_jacobians(&self, finer: &Self) -> bool {
         self.jacobians.len() == finer.jacobians.len()
             && self
@@ -35,6 +72,10 @@ impl Terms {
                 })
     }
 }
+/// True when any corner has a `component_masses` entry with positive `mass_kg`, i.e.
+/// when [RideMode::RetainedComponentInertia](crate::RideMode::RetainedComponentInertia)
+/// has actual mass to retain for `p`. Used to decide whether the more expensive
+/// retained-inertia dynamics path is needed at all.
 pub(crate) fn active(p: &crate::Project) -> bool {
     p.corners.iter().any(|c| {
         [
@@ -47,6 +88,19 @@ pub(crate) fn active(p: &crate::Project) -> bool {
         .any(|b| b.as_ref().is_some_and(|b| b.mass_kg > 0.))
     })
 }
+/// Closes `p` at generalized coordinate `x` (`rack` giving front/rear rack travel)
+/// and returns one [BodyPose] per positive-mass retained component, in a fixed
+/// per-corner order (upper arm, lower arm, rocker, then knuckle) repeated for each
+/// corner in `p.corners` order. [jacobians] and [terms] rely on this order and count
+/// being stable across nearby `x`; a changed body count between calls is itself an
+/// error.
+///
+/// # Errors
+///
+/// Returns [Error] if the underlying kinematic closure at `x`/`rack` fails, or if a
+/// cylinder-tire corner's spindle axis is within 1e-6 (as a unit-vector z-component)
+/// of horizontal, where the tire support height has a non-differentiable camber
+/// cusp and the component-mass derivative is undefined.
 pub(crate) fn poses(p: &crate::Project, rack: [f64; 2], x: X) -> Result<Vec<BodyPose>, Error> {
     let motion = crate::Motion {
         heave: x[0],
@@ -137,6 +191,18 @@ pub(crate) fn poses(p: &crate::Project, rack: [f64; 2], x: X) -> Result<Vec<Body
     }
     Ok(out)
 }
+/// Central-difference position and angular-velocity Jacobians (each w.r.t. `x`) for
+/// every body `provider` returns at `x`, using step `step`. Only perturbs the first
+/// 3 coordinates (heave/roll/pitch) when every body is per-corner (`corner.is_some()`
+/// for all of `base`), since a per-corner body's dependence on its own prescribed
+/// road height is then filled analytically afterward (columns 3..7, one nonzero
+/// column per corner) rather than by finite difference.
+///
+/// # Errors
+///
+/// Propagates `provider`'s error, or returns an error if a perturbed call returns a
+/// different number of bodies than `base` (the retained-body set must stay stable
+/// under the derivative step).
 fn jacobians(
     provider: &impl Fn(X) -> Result<Vec<BodyPose>, Error>,
     x: X,
@@ -181,6 +247,16 @@ fn jacobians(
     }
     Ok(out)
 }
+/// Assembles [Terms] at generalized coordinate `x` and generalized velocity `w` from
+/// the rigid bodies `provider` returns, using central-difference step `step` (and,
+/// when `w` is non-negligible, a second central difference along `w` of half-width
+/// `min(step/max|w|, 0.05)` to form the velocity-product `bias` term). Pass
+/// `w = X::zeros()` to get `mass`/`gravity`/`potential` alone with `bias` left zero.
+///
+/// # Errors
+///
+/// Propagates `provider`'s or [jacobians]'s error, or returns an error if any
+/// assembled term is non-finite.
 pub(crate) fn terms(
     provider: impl Fn(X) -> Result<Vec<BodyPose>, Error>,
     x: X,

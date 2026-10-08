@@ -1,4 +1,14 @@
 //! Per-corner alignment, rest-length, and linkage-angle metrics computed from a solved pose.
+//!
+//! [measure] is a pure function of one corner's static hardpoints, its solved
+//! [crate::Points], and the three solved link angles: it takes no derivative and does
+//! not itself know whether it was called from [crate::solve_corner] (chassis frame) or
+//! a vehicle study (world frame). `motion_ratio` is the one field [measure] always
+//! leaves `None`; callers that measure a perturbed pair of solves (the kinematics
+//! solver, and independently [crate::analyze]/[crate::analyze_with_step]) fill it in
+//! afterward. See the "Alignment and derivatives" and "Commanded motion" sections of
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md> for
+//! the sign conventions and the `_deg`/`_rad`/`_m` unit suffixes used below.
 use serde::{Deserialize, Serialize};
 /// Alignment, rest-length, and rocker/arm angle metrics for one solved corner. See
 /// `docs/model-conventions.md` for sign conventions and the `_deg`/`_rad`/`_m` unit suffixes.
@@ -62,7 +72,14 @@ pub struct Metrics {
 }
 /// Compute [Metrics] for one corner from its solved [crate::Points] and the three
 /// solved link angles `[upper_arm, lower_arm, rocker]`, radians. Called internally by
-/// the kinematics solver; not normally invoked directly.
+/// the kinematics solver; not normally invoked directly, though it takes no private
+/// state and so can also serve as an independent alignment oracle in tests, given any
+/// rigidly consistent set of points (as in `tests/geometry.rs`). Scrub radius and
+/// mechanical trail intersect the steering axis (`upper_ball`-`lower_ball`) with the
+/// horizontal plane through `p.contact_point`, so they remain meaningful in both the
+/// chassis frame (`solve_corner`) and the world frame (vehicle studies); both are
+/// `None` when that axis is (near-)horizontal (no finite intersection) or the
+/// horizontal wheel heading is degenerate.
 pub fn measure(c: &crate::Corner, p: &crate::Points, angles: [f64; 3]) -> Metrics {
     use crate::kinematics::v;
     let side = match c.id {

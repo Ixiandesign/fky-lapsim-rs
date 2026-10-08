@@ -1,18 +1,58 @@
-//! Nonlinear sprung-body dynamics on prescribed horizontal supports.
+//! Nonlinear time-domain ride dynamics on prescribed horizontal supports.
 //!
-//! q = [heave m, roll rad, pitch rad], rotating Ry(pitch)Rx(roll) about chassis COM.
+//! This module integrates the coupled chassis heave/roll/pitch equations of motion
+//! forward in time -- free response, road-excited response, or response to an
+//! explicit generalized load history -- in either [RideMode::Reduced] (massless
+//! links) or [RideMode::RetainedComponentInertia] (configured [crate::ComponentMasses]
+//! retained) fidelity, with static-equilibrium solving and termination-event
+//! diagnostics for travel limits, non-finite state, and lost contact. See
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>,
+//! especially its "Forces and energy" section and its closing distinction between
+//! prescribed-motion kinematics (does not solve forces), static equilibrium (a
+//! stationary force/moment balance), and ride dynamics (this module: it integrates
+//! acceleration over time). A termination event such as a negative support reaction
+//! is a loss-of-contact diagnostic, not a simulated airborne trajectory; a configured
+//! shock `min_length_m`/`max_length_m` stops the run at a geometry solver limit, not a
+//! measured bump stop.
+//!
+//! Generalized coordinates are q = [heave m, roll rad, pitch rad], rotating
+//! Ry(pitch)Rx(roll) about chassis COM -- the same finite-rotation convention used by
+//! [crate::Motion]. Shock compression uses the same sign convention as static
+//! analysis: positive compression and compression velocity share a direction, spring
+//! force is `preload + k*c` (or a validated table), damper force is passive
+//! (`F_d*c_dot >= 0`), and each configured `AxleInterconnect`'s heave/roll rates act on
+//! the averaged (heave) or half-difference (roll) travel of its two corners'
+//! interconnect arms, not a physical two-ended spring's own compression -- see
+//! [InterconnectSample] and [spring_force]/[damper_force].
+//!
 //! Compression derivatives come from exact geometry closure, with finite-difference
-//! refinement. RK4 is conditionally stable: check timestep convergence for each setup.
-//! Select retained component inertia explicitly; contact release remains unsupported.
+//! refinement: a singular or discontinuous compression Jacobian is reported as an
+//! error rather than silently extrapolated. RK4 is conditionally stable: check
+//! timestep convergence for each setup. Select retained component inertia explicitly;
+//! contact release remains unsupported -- once a corner's support reaction goes
+//! negative the run terminates rather than modeling that corner leaving and rejoining
+//! the road. Tire compliance/friction/spin and horizontal/yaw motion are likewise
+//! absent from both fidelity modes.
+//!
+//! [ride] is the primary entry point; [evaluate_ride] evaluates instantaneous
+//! acceleration and support loads at a single state without integrating;
+//! [linearize_ride] linearizes the same equations about static equilibrium instead of
+//! integrating them. [formula_car_demo] builds the illustrative project/request pair
+//! used by `examples/ride.rs` and the ride demonstration in `docs/rust-guide.md`.
 use crate::{AxleInterconnect, Chassis, SpringDamper};
 use crate::{CornerId, Error, Project};
 use serde::{Deserialize, Serialize};
 mod linearization;
 pub use linearization::{linearize_ride, RideLinearization, RideModeShape};
 
-/// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::Reduced].
+/// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::Reduced]:
+/// nonlinear sprung-body dynamics with fixed (non-releasing) contact and massless
+/// links.
 pub const MODEL_FIDELITY: &str = "nonlinear_sprung_body_fixed_contact_massless_links";
-/// Fidelity identifier reported in [RideRun::model_fidelity] for [RideMode::RetainedComponentInertia].
+/// Fidelity identifier reported in [RideRun::model_fidelity] for
+/// [RideMode::RetainedComponentInertia]: nonlinear dynamics with rigid arm/rocker
+/// bodies and a nonspinning knuckle retaining their configured inertia, prescribed
+/// fixed (non-releasing) contact.
 pub const COMPONENT_MODEL_FIDELITY: &str =
     "nonlinear_rigid_arm_rocker_nonspinning_knuckle_inertia_prescribed_fixed_contact";
 /// Ride dynamics fidelity: whether each corner's link/knuckle mass is retained.
@@ -20,12 +60,18 @@ pub const COMPONENT_MODEL_FIDELITY: &str =
 #[serde(rename_all = "snake_case")]
 pub enum RideMode {
     /// Massless wishbones/rocker/knuckle; only the chassis sprung mass, springs, and
-    /// dampers carry inertia and weight.
+    /// dampers carry inertia and weight. The default.
     #[default]
     Reduced,
     /// Include each corner's configured upper/lower arm, rocker, and nonspinning
     /// knuckle/wheel inertia (see [crate::ComponentMasses]). Requires a road input
-    /// with continuous velocity; rejects [RoadInput::Histories].
+    /// with continuous velocity; rejects [RoadInput::Histories], since a piecewise-
+    /// linear history's velocity jumps would need impulse handling for rigid massive
+    /// bodies. If no corner ends up configuring a nonzero component mass, the
+    /// equations of motion reduce to the same massless-link dynamics as
+    /// [RideMode::Reduced]; [RideRun::model_fidelity] still reports
+    /// [COMPONENT_MODEL_FIDELITY] in that case, since it reflects the requested mode
+    /// rather than which bodies actually carry mass.
     RetainedComponentInertia,
 }
 /// Prescribed road height at each corner's wheel, as a function of time.
@@ -58,6 +104,9 @@ pub enum RoadInput {
     /// Continuous piecewise linear heights; times must span the complete run.
     /// Samples are [time seconds, height metres]. Velocity is right-continuous at
     /// interior knots; integration ends the preceding interval with its left velocity.
+    /// Rejected under [RideMode::RetainedComponentInertia] (see there): the velocity
+    /// jump at each interior knot would need impulse handling for rigid massive
+    /// bodies.
     Histories {
         /// Per-corner `[time_s, height_m]` samples, ordered like `Project.corners`;
         /// each series must be sorted, span `[0, duration_s]`, and have at least two points.
@@ -71,32 +120,50 @@ pub enum RoadInput {
 pub struct RideRequest {
     /// Dynamics fidelity; see [RideMode].
     pub mode: RideMode,
-    /// Fixed rack travel in metres for the complete ride.
+    /// Fixed front rack travel, metres, held constant for the complete ride; mirrors
+    /// `rack_rear`.
     pub rack_front: f64,
-    /// Fixed rear rack travel in metres for the complete ride.
+    /// Fixed rear rack travel, metres, held constant for the complete ride; mirrors
+    /// `rack_front`.
     pub rack_rear: f64,
-    /// Coarse central difference step, metres for translations/radians for angles.
-    /// Mass mode verifies half-step acceleration and support reaction convergence.
+    /// Central-difference step, in metres (translations) or radians (angles), used
+    /// only under [RideMode::RetainedComponentInertia] to numerically differentiate
+    /// component-mass pose/Jacobian terms; ignored under [RideMode::Reduced], which
+    /// carries no component mass to differentiate. That mode compares the resulting
+    /// acceleration and support reactions at this step against half (and, if needed,
+    /// a quarter) of it, and errors rather than silently accepting an unrefined
+    /// estimate if they fail to converge. Must be finite and lie in `0.0001..=0.004`
+    /// (see [validate_request]).
     pub derivative_step: f64,
-    /// Total simulated duration, seconds.
+    /// Total simulated duration, seconds; must be finite and non-negative, and
+    /// `(duration_s / dt_s).ceil()` must not exceed the run's sample limit (see
+    /// [validate_request]).
     pub duration_s: f64,
     /// Fixed integration timestep, seconds; a failed stage halves it down to
     /// `min(dt_s, 1e-5 s)` before the run terminates.
     pub dt_s: f64,
-    /// Offsets from equilibrium when solve_equilibrium is true, otherwise absolute.
+    /// Initial `[heave m, roll rad, pitch rad]`: an offset from the solved
+    /// equilibrium when `solve_equilibrium` is true, otherwise an absolute initial
+    /// displacement.
     pub initial_displacement: [f64; 3],
-    /// Heave m/s, roll/pitch rad/s.
+    /// Initial generalized rate `[heave m/s, roll rad/s, pitch rad/s]`.
     pub initial_velocity: [f64; 3],
-    /// Generalized heave force / roll and pitch moments, conjugate to q.
+    /// Generalized heave force / roll and pitch moments, conjugate to q, in
+    /// `[N, N*m, N*m]`. Ignored once `external_force_history` is set.
     pub external_force: [f64; 3],
-    /// Optional piecewise-linear `[time_s, heave_N, roll_Nm, pitch_Nm]` history.
-    /// Replaces `external_force`; at least two finite, strictly increasing rows
+    /// Optional piecewise-linear `[time_s, heave_N, roll_Nm, pitch_Nm]` history,
+    /// linearly interpolated between consecutive rows and replacing `external_force`
+    /// entirely when present. At least two finite, strictly increasing (in time) rows
     /// must cover `[0, duration_s]`. Equilibrium uses its value at time zero.
     pub external_force_history: Option<Vec<[f64; 4]>>,
-    /// Include solved suspension geometry in accepted samples. Defaults to false;
-    /// does not request the additional full-vehicle derivative analysis.
+    /// Include solved suspension geometry (as [RideSample::state]) in accepted
+    /// samples. Defaults to false; does not request the additional full-vehicle
+    /// derivative analysis that [crate::analyze] would perform.
     pub report_states: bool,
-    /// Solve with the road frozen at t=0 before applying initial offsets.
+    /// Solve for static equilibrium with the road frozen at t=0 before applying
+    /// `initial_displacement`/`initial_velocity` (reported as [RideRun::equilibrium]).
+    /// If false, `initial_displacement`/`initial_velocity` are used directly as the
+    /// absolute initial state and `equilibrium` is `None`.
     pub solve_equilibrium: bool,
     /// Prescribed road input for the run; see [RoadInput].
     pub road: RoadInput,
@@ -124,16 +191,23 @@ impl Default for RideRequest {
 /// channel state at a [RideSample]: compression, compression rate, and combined
 /// spring+damper force, in the same conventions as the corner-level fields on
 /// [RideSample] (positive compression/velocity in compression; see [spring_force]/
-/// [damper_force]).
+/// [damper_force]). `heave_compression_m` is the two corners' *averaged* interconnect
+/// arm travel and `roll_compression_m` is their *half-difference* travel -- not a
+/// physical two-ended spring's own compression. Matching a measured or catalog rate
+/// for such a physical spring wired directly between both arm tips means entering
+/// four times that rate on the corresponding [crate::AxleInterconnect] channel, not
+/// the rate itself (see docs/model-conventions.md's "Forces and energy" section).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterconnectSample {
-    /// Symmetric (heave) channel compression, metres.
+    /// Symmetric (heave) channel compression, metres: the average of the two
+    /// corners' interconnect-arm compressions.
     pub heave_compression_m: f64,
     /// Symmetric (heave) channel compression rate, m/s.
     pub heave_velocity_m_s: f64,
     /// Symmetric (heave) channel combined spring+damper force, newtons.
     pub heave_force_n: f64,
-    /// Antisymmetric (roll) channel compression, metres.
+    /// Antisymmetric (roll) channel compression, metres: half the difference between
+    /// the two corners' interconnect-arm compressions.
     pub roll_compression_m: f64,
     /// Antisymmetric (roll) channel compression rate, m/s.
     pub roll_velocity_m_s: f64,
@@ -144,6 +218,7 @@ pub struct InterconnectSample {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RideSample {
     /// Solved geometry at this sample's motion, rack travel and prescribed road.
+    /// `Some` only when [RideRequest::report_states] was true; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<crate::VehicleState>,
     /// Simulation time, seconds, since the start of the run.
@@ -162,6 +237,10 @@ pub struct RideSample {
     pub shock_force_n: [f64; 4],
     /// Vertical prescribed-support reactions, including retained component inertia in mass
     /// mode and any active axle interconnect's contribution (see [InterconnectSample]).
+    /// A value at or below `-1e-6` N means the fixed-contact assumption has failed at
+    /// that corner (the road would need to pull the wheel down to hold it); such a
+    /// state is never returned in an accepted sample -- the evaluation instead returns
+    /// `Err` ([evaluate_ride]) or populates [RideTermination] ([ride]).
     pub support_reaction_n: [f64; 4],
     /// Front-axle interconnect state, present exactly when [crate::Project::front_interconnect]
     /// is configured.
@@ -171,16 +250,27 @@ pub struct RideSample {
     /// is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rear_interconnect: Option<InterconnectSample>,
-    /// Total mechanical energy (kinetic + gravitational + spring potential) at this sample, joules.
+    /// Total mechanical energy (kinetic + gravitational + spring potential, including
+    /// any configured axle interconnect's spring potential) at this sample, joules.
     pub energy_j: f64,
-    /// Positive integral of signed damper force times compression velocity.
+    /// Running integral, from t=0, of every corner damper's (and any configured axle
+    /// interconnect damper's) signed force times its own compression velocity. Each
+    /// passive term satisfies `F_d*c_dot >= 0`, so this sum is monotonically
+    /// nondecreasing over the run.
     pub dissipated_work_j: f64,
-    /// Integral of the selected model's support reactions times prescribed road velocity.
+    /// Running integral, from t=0, of the selected model's support reactions times
+    /// the prescribed road's vertical velocity at each corner: the work the moving
+    /// road does on the vehicle through the fixed-contact constraint. Zero for a flat
+    /// or otherwise stationary road.
     pub support_work_j: f64,
-    /// Integral of the requested generalized external force/moment along the chassis rate.
+    /// Running integral, from t=0, of the requested generalized external
+    /// force/moment along the chassis rate.
     pub external_work_j: f64,
-    /// `energy_j` minus the initial energy plus dissipated/support/external work; an
-    /// energy-conservation residual used as a correctness check, not a physical quantity.
+    /// `(energy_j - initial energy_j) + dissipated_work_j - support_work_j -
+    /// external_work_j`: an energy-conservation residual that should be zero by
+    /// construction and should shrink under timestep (and, in mass mode,
+    /// derivative-step) refinement. It is a numerical correctness check on the
+    /// integration, not a physical quantity.
     pub energy_balance_error_j: f64,
 }
 /// Why a [RideRun] stopped before its requested `duration_s`.
@@ -190,7 +280,10 @@ pub struct RideTermination {
     pub time_s: f64,
     /// Time of the last successfully accepted sample, if any.
     pub last_valid_time_s: Option<f64>,
-    /// The corner whose geometry or contact condition triggered termination, if identifiable.
+    /// The corner whose geometry or contact condition triggered termination, if
+    /// identifiable. `None` when the triggering condition -- a non-finite state, an
+    /// unstable or non-convergent equilibrium solve, or a rejected input -- cannot be
+    /// attributed to a single corner.
     pub corner: Option<CornerId>,
     /// Human-readable termination reason.
     pub reason: String,
@@ -202,22 +295,58 @@ pub struct RideRun {
     pub model_fidelity: String,
     /// Corner identifiers, in the same order as `compression_m`/`shock_force_n`/etc.
     pub corner_ids: [CornerId; 4],
-    /// Solved static-equilibrium `[heave, roll, pitch]`, if `solve_equilibrium` was requested.
+    /// Solved static-equilibrium `[heave, roll, pitch]`, if
+    /// [RideRequest::solve_equilibrium] was requested; `None` otherwise.
     pub equilibrium: Option<[f64; 3]>,
     /// Every accepted sample, including the initial state, in time order.
     pub samples: Vec<RideSample>,
     /// None means the requested duration was completed.
     pub termination: Option<RideTermination>,
 }
-/// Integrate coupled heave/roll/pitch using RK4 and exact nonlinear ground closure.
-/// Reduced mode omits component inertia; retained mode includes configured bodies.
-/// Supports are rigid horizontal planes in both modes.
-/// Tire compliance/friction/spin, horizontal/yaw motion and contact release are absent.
-/// Geometry failure means loss of solver validity, not a calibrated physical bump stop.
-/// Negative support below -1e-6 N terminates contact validity. Stage failures are
-/// localized by halving the step to min(request.dt_s, 1e-5 s).
-/// Invalid input, work limits and failed static equilibrium return Err; a terminal
-/// integration event returns Ok with termination populated and the valid prefix.
+/// Integrate this project's coupled heave/roll/pitch ride dynamics forward in time.
+///
+/// Uses fixed-step RK4 with exact nonlinear ground closure at every stage.
+/// [RideMode::Reduced] omits component inertia; [RideMode::RetainedComponentInertia]
+/// includes each corner's configured bodies (see [crate::ComponentMasses]). Supports
+/// are rigid horizontal planes in both modes. Tire compliance/friction/spin,
+/// horizontal/yaw motion and contact release are absent. A geometry failure mid-run
+/// means loss of solver validity, not a calibrated physical bump stop. A support
+/// reaction below -1e-6 N terminates contact validity rather than being reported as a
+/// negative load. A failed integration stage is localized by halving the step down to
+/// `min(request.dt_s, 1e-5 s)` before the run gives up and terminates.
+///
+/// If `r.solve_equilibrium` is set, equilibrium is solved once up front with the road
+/// frozen at `t = 0`, and `r.initial_displacement`/`r.initial_velocity` are applied as
+/// offsets from it; otherwise they are the absolute initial state. The returned
+/// [RideRun::samples] always includes this initial state as its first entry, even
+/// when `r.duration_s` is zero.
+///
+/// # Errors
+/// Returns `Err` for invalid input or setup, never for an in-run physical/model
+/// event: `Project::validate` or [validate_request] rejecting `p`/`r` (a malformed
+/// project or request, including an incompatible retained-component-inertia +
+/// history-road combination); a failed internal static-equilibrium solve when
+/// `r.solve_equilibrium` is true (unstable, singular, or non-convergent); or
+/// exceeding the run's hard sample/work limit mid-integration. A physical/model-
+/// validity event encountered while integrating -- a non-finite state, a
+/// singular/discontinuous compression Jacobian, a violated shock travel limit, or a
+/// negative support reaction (lost contact) -- does not return `Err`; it returns `Ok`
+/// with [RideRun::termination] populated and [RideRun::samples] holding every sample
+/// accepted before that point.
+///
+/// # Examples
+/// ```rust
+/// use fky_lapsim_core::{dynamics::formula_car_demo, ride};
+///
+/// let (project, request) = formula_car_demo()?;
+/// let run = ride(&project, &request)?;
+/// println!("Mode: {}", run.model_fidelity);
+/// println!("Samples: {}", run.samples.len());
+/// if let Some(event) = &run.termination {
+///     println!("Stopped at {} s: {}", event.time_s, event.reason);
+/// }
+/// # Ok::<(), fky_lapsim_core::Error>(())
+/// ```
 pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
     p.validate()?;
     validate_request(r)?;
@@ -319,10 +448,25 @@ pub fn ride(p: &Project, r: &RideRequest) -> Result<RideRun, Error> {
     Ok(run)
 }
 /// Evaluate instantaneous ride acceleration and support loads at an absolute
-/// generalized state. Does not solve equilibrium or apply initial offsets.
-/// Time must lie in `[0, duration_s]`; contact/geometry failures return `Err`.
-/// Work integrals and the energy-balance residual are zero (no integration).
-/// Geometry is included when `report_states` is true.
+/// generalized state, without integrating.
+///
+/// Unlike [ride], this does not solve equilibrium or apply `r`'s initial
+/// displacement/velocity offsets -- `displacement`/`velocity` are used directly as
+/// the absolute state at `time_s`. Because no integration happens, the returned
+/// [RideSample]'s `dissipated_work_j`, `support_work_j`, `external_work_j`, and
+/// `energy_balance_error_j` are all zero; `state` is included when
+/// [RideRequest::report_states] is true, exactly as for [ride].
+///
+/// # Errors
+/// Returns `Err` if `Project::validate` or [validate_request] rejects `p`/`r`; if
+/// `time_s` is non-finite, negative, or greater than `r.duration_s`, or if
+/// `displacement`/`velocity` contain a non-finite component; or for the same
+/// physical/geometry failures [ride] reports as a mid-run termination event --
+/// unreachable or singular/discontinuous compression geometry, a non-finite result, a
+/// violated shock travel limit, a negative support reaction, or (in
+/// [RideMode::RetainedComponentInertia]) a failed derivative refinement -- except
+/// that here they surface directly as `Err` rather than as a populated
+/// [RideTermination].
 pub fn evaluate_ride(
     p: &Project,
     r: &RideRequest,
@@ -371,8 +515,20 @@ fn evaluate_reported(
     }
     Ok(sample)
 }
-/// Illustrative 300 kg formula-car-scale sprung mass, not a validated race-car model.
-/// Equal preload is derived from the actual symmetric rest-pose compression Jacobian.
+/// Build the illustrative formula-car-scale demonstration project and ride request
+/// used by `examples/ride.rs` and the ride demonstration in `docs/rust-guide.md`.
+///
+/// Starts from [crate::Project::example], overrides the chassis to an illustrative
+/// 300 kg sprung mass with `[100, 250, 300]` kg m^2 principal roll/pitch/yaw inertia
+/// (not a validated race-car model), then derives an equal preload at each corner
+/// from the actual symmetric rest-pose compression Jacobian so the car sits at
+/// equilibrium under its own weight. The returned request adds a small (5 mm) initial
+/// heave offset from that equilibrium, with otherwise-default [RideRequest] settings.
+///
+/// # Errors
+/// Returns `Err` only if the rest-pose compression geometry or its Jacobian cannot be
+/// solved for the modified example project; this does not happen for the unmodified
+/// fixture.
 pub fn formula_car_demo() -> Result<(Project, RideRequest), Error> {
     let mut p = Project::example();
     p.name = "Formula-car-scale ride demonstration".into();
@@ -410,7 +566,30 @@ fn event(p: &Project, time_s: f64, last_valid_time_s: Option<f64>, e: Error) -> 
         reason: e.message,
     }
 }
-/// Validate ride input and bounded work without running equilibrium or physics.
+/// Validate ride input and bound the eventual integration work, without running
+/// equilibrium or physics.
+///
+/// Called internally by [ride] and [evaluate_ride] before any physics; exposed
+/// publicly so a caller can validate a [RideRequest] up front (e.g. in a UI) without
+/// paying for a run.
+///
+/// # Errors
+/// Returns `Err` if: `rack_front`/`rack_rear` are non-finite; `derivative_step` is
+/// non-finite or outside `0.0001..=0.004`; `mode` is
+/// [RideMode::RetainedComponentInertia] and `road` is [RoadInput::Histories] (a
+/// piecewise-linear history's velocity jumps would need impulse handling for rigid
+/// massive bodies); `duration_s`, `dt_s`, `initial_displacement`, `initial_velocity`,
+/// or `external_force` are non-finite, or `duration_s < 0`, or `dt_s <= 0`, or
+/// `(duration_s / dt_s).ceil()` exceeds the run's sample limit; `external_force_history`
+/// is present but has fewer than two or more than the sample-limit's worth of rows,
+/// contains a non-finite value, does not cover `[0, duration_s]`, or is not strictly
+/// increasing in time with a finite per-segment rate; `road` fails its own
+/// finiteness/range checks (a [RoadInput::Sine]/[RoadInput::SpatialSine] whose
+/// amplitude/frequency/wavelength/speed is non-finite, negative where disallowed, or
+/// overflows when combined; or a [RoadInput::Histories] series that is too short,
+/// non-finite, unsorted, or does not span `[0, duration_s]`); or the combined count
+/// of road-history and `external_force_history` knots over `[0, duration_s]`, stepped
+/// at `dt_s`, would exceed the run's sample limit.
 pub fn validate_request(r: &RideRequest) -> Result<(), Error> {
     if !r.rack_front.is_finite()
         || !r.rack_rear.is_finite()
@@ -633,7 +812,7 @@ fn compression_map(
     q: [f64; 3],
     z: [f64; 4],
 ) -> Result<([f64; 4], [[f64; 3]; 4]), Error> {
-    let m = compression_map_request(p, q, z, &RideRequest::default())?;
+    let m = compression_map_request(p, q, z, &RideRequest::default(), false)?;
     Ok((m.c, m.j))
 }
 /// Shock compression/Jacobian (`c`/`j`, unchanged from before this type existed) plus, for
@@ -653,9 +832,10 @@ fn compression_map_request(
     q: [f64; 3],
     z: [f64; 4],
     r: &RideRequest,
+    force_tight: bool,
 ) -> Result<CompressionMap, Error> {
     let rack = [r.rack_front, r.rack_rear];
-    let tight = r.mode == RideMode::RetainedComponentInertia;
+    let tight = force_tight || r.mode == RideMode::RetainedComponentInertia;
     let (c, heave_arm, roll_arm) = compression(p, q, z, rack, tight)?;
     let mut j = [[0.; 3]; 4];
     let mut heave_arm_j = [[0.; 3]; 4];
@@ -843,7 +1023,7 @@ fn evaluate(
     let q = [y[0], y[1], y[2]];
     let v = [y[3], y[4], y[5]];
     let (z, zd) = road_at(p, &r.road, t, left);
-    let cm = compression_map_request(p, q, z, r)?;
+    let cm = compression_map_request(p, q, z, r, false)?;
     check_limits(p, cm.c)?;
     if r.mode == RideMode::RetainedComponentInertia && crate::mass::active(p) {
         return evaluate_components(p, r, t, y, q, v, z, zd, cm);
@@ -1161,7 +1341,10 @@ fn static_residual(
     q: [f64; 3],
 ) -> Result<nalgebra::Vector3<f64>, Error> {
     let (z, _) = road_at(p, &r.road, 0., false);
-    let cm = compression_map_request(p, q, z, r)?;
+    // Static equilibrium and its stiffness differentiate the preload force times this Jacobian, so they
+    // always close the geometry tightly: at the looser reduced-mode tolerance the closure noise times a
+    // rocker preload can exceed the stiffness derivative-refinement check on near-zero coupling terms.
+    let cm = compression_map_request(p, q, z, r, true)?;
     let (c, j) = (cm.c, cm.j);
     let component_gravity = if r.mode == RideMode::RetainedComponentInertia
         && crate::mass::active(p)
@@ -1277,15 +1460,28 @@ fn equilibrate(p: &Project, r: &RideRequest) -> Result<[f64; 3], Error> {
     }
     Err(error("equilibrium iteration limit"))
 }
-/// Bilateral spring force; compression is relative to design shock length.
-/// Parameters/tables must be validated through Project::validate or Corner::validate.
+/// Spring force at compression `c` (metres, relative to design shock length, same
+/// sign convention as [RideSample::compression_m]): `preload + spring_rate * c` for a
+/// linear spring, or the tabulated `spring_curve` linearly interpolated at `c` (and
+/// clamped flat beyond the table's ends) when one is configured. The same law is used
+/// on both sides of design length ("bilateral"): there is no separate
+/// compression/rebound spring law, unlike [damper_force]. `preload` is a force at the
+/// design pose, not a second displacement offset (see docs/model-conventions.md's
+/// "Forces and energy" section). Parameters/tables must be validated through
+/// `Project::validate` or `Corner::validate`.
 pub fn spring_force(s: &SpringDamper, c: f64) -> f64 {
     s.spring_curve
         .as_ref()
         .map_or(s.preload + s.spring_rate * c, |table| table_force(table, c))
 }
-/// Signed passive force, positive in compression and negative in rebound.
-/// Parameters/tables must be validated through Project::validate or Corner::validate.
+/// Signed passive damper force at compression velocity `u` (m/s; positive in
+/// compression, negative in rebound, matching [RideSample::compression_velocity_m_s]).
+/// Uses `compression_damping`/`compression_curve` for `u >= 0` and
+/// `rebound_damping`/`rebound_curve` for `u < 0`: `u * b` for a linear rate `b`, or
+/// `u.signum() * table(u.abs())` for a tabulated curve (re-signed back to `u`'s
+/// direction). Guaranteed passive: `u * damper_force(s, u) >= 0` for any finite `u`
+/// (see docs/model-conventions.md's "Forces and energy" section). Parameters/tables
+/// must be validated through `Project::validate` or `Corner::validate`.
 pub fn damper_force(s: &SpringDamper, u: f64) -> f64 {
     let (table, b) = if u >= 0. {
         (&s.compression_curve, s.compression_damping)
@@ -1296,8 +1492,12 @@ pub fn damper_force(s: &SpringDamper, u: f64) -> f64 {
         .as_ref()
         .map_or(u * b, |table| u.signum() * table_force(table, u.abs()))
 }
-/// Spring potential with arbitrary zero at design compression.
-/// Uses the exact piecewise integral for a validated tabulated law.
+/// Spring potential energy at compression `c`, with an arbitrary zero at design
+/// compression (`c = 0`): `preload*c + spring_rate*c*c/2` for a linear spring, or the
+/// exact piecewise integral of the tabulated `spring_curve` (matching [spring_force]
+/// exactly, not a numerical approximation) when one is configured. A negative value
+/// relative to that zero is valid -- this is a potential difference, not an absolute
+/// energy (see docs/model-conventions.md's "Forces and energy" section).
 pub fn spring_energy(s: &SpringDamper, c: f64) -> f64 {
     s.spring_curve
         .as_ref()
@@ -1342,11 +1542,25 @@ fn table_integral(table: &[[f64; 2]], x: f64) -> f64 {
     let last = table.last().unwrap();
     integral + (x - last[0]) * last[1]
 }
-/// Tangent wheel stiffness, including preload geometric stiffness.
+/// Tangent wheel-rate at a wheel, including preload-dependent geometric stiffness:
+/// `k * ratio * ratio + force * gradient`, where `k` is the spring rate, `force` is
+/// the spring force `F_s` at the current compression (not including damper force),
+/// `ratio` is the motion ratio `dc/dx` (compression per unit upward wheel-center
+/// travel), and `gradient` is that motion ratio's own derivative `d^2 c/dx^2`. The
+/// familiar squared-motion-ratio term `k * ratio^2` alone omits this
+/// `force * gradient` geometric term (see docs/model-conventions.md's "Forces and
+/// energy" section).
 pub fn wheel_rate(k: f64, force: f64, ratio: f64, gradient: f64) -> f64 {
     k * ratio * ratio + force * gradient
 }
-/// Exact kinetic energy for R=Ry(pitch)Rx(roll), rotating about chassis COM.
+/// Exact chassis kinetic energy at generalized pose `q` and rate `v`, for the finite
+/// rotation `R = Ry(pitch) * Rx(roll)` about the chassis center of mass (the same
+/// convention as [crate::Motion] and this module's generalized coordinates): heave
+/// translation plus roll/pitch rotation using `c.inertia`, with the effective
+/// pitch-axis inertia `inertia[1]*cos(pitch)^2 + inertia[2]*sin(pitch)^2` accounting
+/// for how the pitch and yaw principal axes rotate relative to the world pitch axis
+/// as the chassis pitches. Exactly equivalent to evaluating kinetic energy directly
+/// from the instantaneous angular velocity implied by differentiating `R(t)`.
 pub fn chassis_kinetic_energy(c: &Chassis, q: [f64; 3], v: [f64; 3]) -> f64 {
     let a = c.inertia[1] * q[1].cos().powi(2) + c.inertia[2] * q[1].sin().powi(2);
     0.5 * (c.sprung_mass * v[0] * v[0] + c.inertia[0] * v[1] * v[1] + a * v[2] * v[2])

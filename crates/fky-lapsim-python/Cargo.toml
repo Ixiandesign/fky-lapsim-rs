@@ -7,6 +7,7 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "PyO3 bindings exposing fky-lapsim-core to Python as the fky_lapsim._native extension module."
+readme = "README.md"
 publish = false
 [lib]
 name = "_native"

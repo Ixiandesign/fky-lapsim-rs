@@ -1,6 +1,9 @@
 //! The [Project] schema: static hardpoints, tire envelope, spring/damper law, and optional
-//! retained component masses for each of the four corners. See `docs/model-conventions.md`
-//! for the sign/unit conventions these fields follow.
+//! retained component masses for each of the four corners. [Project::validate] and
+//! [Corner::validate] check the geometric and physical invariants this schema relies on
+//! before any solver runs. Coordinates are SI: metres, x forward / y left / z up. See
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md> for the
+//! full sign/unit conventions these fields follow.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -118,6 +121,7 @@ pub enum TireProfile {
     /// requires `tire_width / 2 < tire_radius`.
     Torus,
 }
+/// Default [Corner::rack_axis]: the chassis-fixed +y direction through the origin.
 fn default_rack_axis() -> [Point; 2] {
     [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
 }
@@ -296,7 +300,18 @@ impl Project {
     /// and distinct; each corner's own [Corner::validate]; and, for each configured
     /// [AxleInterconnect], its spring/damper laws and that both paired corners carry all
     /// four interconnect hardpoints. Kinematics, analysis, ride, and optimization entry
-    /// points call this internally.
+    /// points call this internally, so callers that only use those APIs do not need to
+    /// call it again themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [Error] (never panics) if: `schema_version != 1`; the chassis
+    /// `sprung_mass`, `center_of_mass`, or `inertia` is non-finite, non-positive, or
+    /// violates the principal-inertia triangle inequality; the four corners are not
+    /// exactly one of each [CornerId]; any individual corner's [Corner::validate]
+    /// fails; or a configured [AxleInterconnect]'s heave/roll spring/damper law is
+    /// invalid, or either of its two paired corners is missing one of its four
+    /// interconnect hardpoints.
     pub fn validate(&self) -> Result<(), Error> {
         require(self.schema_version == 1, "unsupported schema version")?;
         require(
@@ -446,6 +461,9 @@ impl Project {
     }
 }
 
+/// `Ok(())` when `condition` holds, else `Err` carrying `message`. The shared helper
+/// behind every check in this module's `validate` functions, so failures always
+/// produce a consistent [Error].
 fn require(condition: bool, message: impl Into<String>) -> Result<(), Error> {
     if condition {
         Ok(())
@@ -455,16 +473,23 @@ fn require(condition: bool, message: impl Into<String>) -> Result<(), Error> {
         })
     }
 }
+/// Componentwise `a - b`.
 fn sub(a: Point, b: Point) -> Point {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
+/// Euclidean norm of a 3-vector.
 fn norm(a: Point) -> f64 {
     a[0].hypot(a[1]).hypot(a[2])
 }
+/// True when `a` and `b` are finite and more than 1e-10 m apart; used to reject
+/// degenerate (coincident) axis/link endpoints during validation.
 fn distinct(a: Point, b: Point) -> bool {
     let n = norm(sub(a, b));
     n.is_finite() && n > 1e-10
 }
+/// True when `a`, `b`, `c` are finite, pairwise non-coincident, and not collinear
+/// (their unit edge vectors' cross product exceeds 1e-10 in norm); used to reject
+/// degenerate wishbone/rocker/steering triangles during validation.
 fn triangle(a: Point, b: Point, c: Point) -> bool {
     let u = sub(b, a);
     let v = sub(c, a);
@@ -484,12 +509,27 @@ fn triangle(a: Point, b: Point, c: Point) -> bool {
 
 impl Corner {
     /// Checks finite/positive/symmetric component masses and inertias (when present);
-    /// the corner's own spring/damper law (see [validate_spring_damper]); finite
+    /// the corner's own spring/damper law (see `validate_spring_damper`); finite
     /// hardpoints; distinct axis endpoints; nondegenerate wishbone/rocker triangles;
     /// positive tire parameters; the torus width/radius constraint; and, for each
     /// interconnect arm, that it is paired with its anchor, finite, distinct from its
     /// anchor, and forms a nondegenerate lever with the rocker axis. Called by
     /// [Project::validate] for every corner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [Error] (never panics) if: a configured component mass has a
+    /// non-finite/negative `mass_kg`, a non-finite center of mass, or (when
+    /// `mass_kg > 0`) an inertia tensor that is not finite, symmetric, positive, or
+    /// triangle-inequality-satisfying; this corner's [SpringDamper] fails
+    /// `validate_spring_damper`; any hardpoint is non-finite; any axis (wishbone,
+    /// rocker, spindle, rack, kingpin, tie rod, pushrod, or shock) has coincident
+    /// endpoints; a wishbone, rocker-lever, or upright-steering triangle is degenerate
+    /// (collinear); `tire_radius`/`tire_width` are not both finite and positive; a
+    /// [TireProfile::Torus] tire's half width is not smaller than its outer radius; or
+    /// an interconnect arm/anchor pair (`rocker_heave_arm`/`heave_arm_anchor`,
+    /// `rocker_roll_arm`/`roll_arm_anchor`) is only partially configured, non-finite,
+    /// degenerate, or forms a degenerate lever with the rocker axis.
     pub fn validate(&self) -> Result<(), Error> {
         let c = self;
         for (name, body) in [

@@ -48,3 +48,35 @@ fn ride_tables_use_recorded_corner_order_and_export_loads_energy_and_interconnec
     assert!(result_table("sweep", &json!({})).is_err());
     assert!(result_table("unknown", &json!([])).is_err());
 }
+
+#[test]
+fn lap_tables_have_one_row_per_trace_point_and_merge_channels() {
+    let run = json!({
+        "trace": {"apex_index": [2], "distance_m": [0., 1., 2.], "speed_m_s": [10., 11., 12.], "radius_m": [1e5, 20., 20.]},
+        "channels": {"distance_m": [0., 1., 2.], "speed_kmh": [36., 39.6, 43.2], "gear": [1, 1, 2]}
+    });
+    let t = result_table("lap", &run).unwrap();
+    assert_eq!(t.rows.len(), 3);
+    let column = |s: &str| t.columns.iter().position(|c| c == s).unwrap();
+    assert_eq!(t.rows[1][column("speed_m_s")], json!(11.));
+    assert_eq!(t.rows[1][column("speed_kmh")], json!(39.6));
+    assert_eq!(t.rows[2][column("gear")], json!(2));
+    // the channel copy of distance does not duplicate the trace column
+    assert_eq!(t.columns.iter().filter(|c| *c == "distance_m").count(), 1);
+    assert!(!t.columns.iter().any(|c| c == "apex_index"));
+}
+
+#[test]
+fn lap_tables_reject_a_missing_trace_and_mismatched_arrays() {
+    assert!(result_table("lap", &json!({"metrics": {}})).is_err());
+    assert!(result_table(
+        "lap",
+        &json!({"trace": {"distance_m": [0., 1.], "speed_m_s": [1.]}})
+    )
+    .is_err());
+    assert!(result_table(
+        "lap",
+        &json!({"trace": {"distance_m": [0., 1.]}, "channels": {"gear": [1]}})
+    )
+    .is_err());
+}

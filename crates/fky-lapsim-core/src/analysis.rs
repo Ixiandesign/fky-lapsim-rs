@@ -1,4 +1,18 @@
 //! Optional expanded analysis; never called by a dynamics stage.
+//!
+//! [analyze]/[analyze_with_step] first solve a [VehicleState] the same way
+//! [crate::simulate] does, then add central-difference geometry derivatives (motion
+//! ratio and its gradient, camber/toe/caster gain, spring wheel rate) plus projected
+//! front-view instant centers and geometric roll centers. All of
+//! it is taken with the chassis pose and rack held fixed while perturbing one corner's
+//! world wheel-center height, so it is strictly separate from simulation and from the
+//! reduced-dynamics model. Every derived quantity that can be undefined — a failed
+//! perturbation, a spring-table knot, a degenerate front-view geometry — is reported
+//! through [OptionalValue] with an explicit reason rather than a zero. See the
+//! "Expanded geometry analysis" section of
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the exact derivative coordinate, step bounds, and the parallel-horizontal-arm
+//! roll-center limit implemented in [geometric_roll_center].
 use crate::{CornerId, Error, Motion, Project, VehicleState};
 use serde::{Deserialize, Serialize};
 /// A possibly-undefined derived quantity. Serializes as `{value, reason}`. An
@@ -122,9 +136,22 @@ pub struct Analysis {
     /// Signed world-x front-minus-rear distance between right contact points, metres.
     pub right_contact_wheelbase_m: f64,
 }
-/// Tangent stiffness including preload-dependent geometry.
+/// Tangent wheel-rate `k*ratio^2 + force*gradient` including preload-dependent
+/// geometric stiffness, where `ratio`/`gradient` are the motion-ratio value/gradient
+/// (`dc/dx`/`d^2c/dx^2`) and `k`/`force` are the spring's local tangent rate and its
+/// force at the solved compression. The squared-motion-ratio term alone omits the
+/// `force*gradient` geometric-stiffness term; see the "Forces and energy" section of
+/// <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>.
 pub use crate::dynamics::wheel_rate;
-/// Intersection of projected normals to the two ball-joint velocities.
+/// Intersection of the projected normals to the upper/lower ball-joint velocities in
+/// the world y-z plane: the projected front-view instantaneous center construction
+/// described in [ProjectedCenter]. `upper`/`lower` are the ball joints' `[y, z]`
+/// positions and `vu`/`vl` are their `[y, z]` velocities (both metres / metres-per-unit
+/// of the same perturbation). Returns a reason instead of a point when: any input is
+/// nonfinite; either velocity is (near-)zero, so it has no well-defined normal; the
+/// normals coincide, so every point on them is an equally valid center; or the normals
+/// are parallel but distinct, so the center lies at infinity along the shared
+/// direction (returned via `direction_yz`, not as a very large finite point).
 pub fn projected_center(
     upper: [f64; 2],
     lower: [f64; 2],
@@ -172,7 +199,17 @@ pub fn projected_center(
         reason: None,
     }
 }
-/// Geometric intersection of contact-to-IC lines in world front-view coordinates.
+/// Geometric (not force-based) roll center: intersects the left/right contact-to-IC
+/// lines in the world y-z plane, where each IC line runs from that corner's contact
+/// point (`left_contact`/`right_contact`, `[y, z]` metres) toward its
+/// [ProjectedCenter] (`left`/`right`, either a finite point or a direction at
+/// infinity). Returns a reason instead of a point when: either `ProjectedCenter` is
+/// itself undefined; a contact point coincides with its own projected center, so that
+/// side has no defined line direction; or the two lines are parallel or coincide, with
+/// one exception — when both centers lie at lateral infinity on a horizontal line
+/// (the parallel-horizontal-arm limit), this explicitly selects the axle contact
+/// midpoint's height on that shared line as the limiting roll-center height. That
+/// special case is not applied to any other coincident-line configuration.
 pub fn geometric_roll_center(
     left_contact: [f64; 2],
     left: &ProjectedCenter,
@@ -226,12 +263,50 @@ pub fn geometric_roll_center(
 /// camber/toe gradients, wheel rate, and projected instant/roll centers, using a
 /// default 0.2 mm wheel-height derivative step. See [analyze_with_step] to control
 /// that step explicitly.
+///
+/// # Errors
+///
+/// Returns an [Error] under the same conditions as [crate::simulate] (invalid
+/// project, nonfinite motion, or a corner that fails to close), since `m` is solved
+/// the same way before any derivative is taken.
+///
+/// # Examples
+///
+/// ```
+/// use fky_lapsim_core::{analyze, Motion, Project};
+///
+/// # fn main() -> Result<(), fky_lapsim_core::Error> {
+/// let project = Project::example();
+/// let analysis = analyze(&project, &Motion::default())?;
+/// println!("Front wheel track: {} m", analysis.front.wheel_track_m);
+/// println!("Front projected roll center: {:?}", analysis.front.geometric_roll_center_yz_m);
+/// # Ok(())
+/// # }
+/// ```
 pub fn analyze(p: &Project, m: &Motion) -> Result<Analysis, Error> {
     analyze_with_step(p, m, 0.0002)
 }
 /// Like [analyze], with an explicit wheel-height derivative step `h` (metres, must be
 /// finite and in `1e-6..=0.01`) for refinement studies. Smaller values are not
 /// automatically more accurate; check sensitivity to `h` before trusting a gradient.
+///
+/// # Errors
+///
+/// Returns an [Error] when `h` is not finite or lies outside `1e-6..=0.01`, or under
+/// the same conditions as [analyze] otherwise.
+///
+/// # Examples
+///
+/// ```
+/// use fky_lapsim_core::{analyze_with_step, Motion, Project};
+///
+/// # fn main() -> Result<(), fky_lapsim_core::Error> {
+/// let project = Project::example();
+/// let refined = analyze_with_step(&project, &Motion::default(), 0.0001)?;
+/// println!("motion ratio: {:?}", refined.corners[0].motion_ratio.value);
+/// # Ok(())
+/// # }
+/// ```
 pub fn analyze_with_step(p: &Project, m: &Motion, h: f64) -> Result<Analysis, Error> {
     use crate::kinematics::{at_world_height, err, v, Frame, V};
     use nalgebra::UnitQuaternion;

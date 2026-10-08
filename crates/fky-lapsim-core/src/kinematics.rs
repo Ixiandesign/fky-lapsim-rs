@@ -1,6 +1,11 @@
 //! Quaternion tangent-space Newton-Raphson corner closure: solves one corner's rigid
-//! linkage for a commanded jounge/road/world-height goal and reports its solved
-//! points, orientation, and [crate::Metrics].
+//! linkage for a commanded jounce/road/world-height goal and reports its solved
+//! points, orientation, and [crate::Metrics]. [solve_corner] is the single-corner
+//! entry point; vehicle-level studies (`simulate`, `sweep`) drive the same closure
+//! per corner with a chassis-relative goal instead of a plain jounce.
+//!
+//! See <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the commanded-motion, sign, and unit conventions used here.
 use crate::{Corner, CornerId, Error, Metrics, Point};
 use serde::{Deserialize, Serialize};
 /// One corner's solved hardpoints, in the coordinate frame of the enclosing
@@ -81,39 +86,55 @@ impl CornerState {
     }
 }
 use nalgebra::{SMatrix, SVector, Unit, UnitQuaternion, Vector3};
+/// Internal 3-vector representation of a [Point], for nalgebra arithmetic.
 pub(crate) type V = Vector3<f64>;
+/// Stacked 6-dof residual/step vector: translation (0..3) then rotation tangent (3..6).
 type R6 = SVector<f64, 6>;
+/// Converts a [Point] to its nalgebra vector form.
 pub(crate) fn v(p: Point) -> V {
     V::from(p)
 }
+/// Builds an [Error] from a message string; the sole error constructor in this module.
 pub(crate) fn err(s: &str) -> Error {
     Error { message: s.into() }
 }
+/// A rigid transform (rotation then translation) from chassis frame into the frame a
+/// [CornerState] is ultimately reported in; identity for [solve_corner], the chassis
+/// pose for vehicle-level studies.
 #[derive(Clone)]
 pub(crate) struct Frame {
+    /// Rotation applied before translation.
     pub rotation: UnitQuaternion<f64>,
+    /// Translation applied after rotation.
     pub translation: V,
 }
 impl Frame {
+    /// The identity transform: no rotation, no translation.
     pub(crate) fn identity() -> Self {
         Self {
             rotation: UnitQuaternion::identity(),
             translation: V::zeros(),
         }
     }
+    /// Maps a point through this transform: `rotation * p + translation`.
     pub(crate) fn point(&self, p: V) -> V {
         self.rotation * p + self.translation
     }
 }
+/// The solved corner's free-body pose relative to the design pose: a rigid rotation
+/// `q` and translation `t` of the knuckle/wheel assembly about [Corner::wheel_center].
 #[derive(Clone)]
 struct Pose {
     q: UnitQuaternion<f64>,
     t: V,
 }
 impl Pose {
+    /// Maps a design-pose point on the moving assembly through this pose.
     fn point(&self, c: &Corner, p: Point) -> V {
         v(c.wheel_center) + self.t + self.q * (v(p) - v(c.wheel_center))
     }
+    /// Applies a tangent-space Newton step `d` (translation increment then rotation
+    /// increment as a scaled axis) to produce the next candidate pose.
     fn step(&self, d: R6) -> Self {
         Self {
             t: self.t + d.fixed_rows::<3>(0).into_owned(),
@@ -121,15 +142,25 @@ impl Pose {
         }
     }
 }
+/// The commanded goal the Newton solve closes onto: a plain chassis-relative jounce,
+/// a road-height contact constraint expressed in `Frame`, or a world-height wheel
+/// center constraint expressed in `Frame` (used for reclosure/derivative analysis).
 #[derive(Clone)]
 pub(crate) enum Constraint {
+    /// Wheel-center jounce relative to the chassis, metres (see [solve_corner]).
     Jounce(f64),
+    /// Tire support point's height, metres, in the given frame.
     Road(Frame, f64),
+    /// Wheel-center height, metres, in the given frame.
     WorldHeight(Frame, f64),
 }
+/// Commanded rack translation of `steering_inner` along the corner's `rack_axis`.
 fn rack_offset(c: &Corner, rack: f64) -> V {
     (v(c.rack_axis[1]) - v(c.rack_axis[0])).normalize() * rack
 }
+/// Tire support (contact representative) point for `c.tire_profile`, given the
+/// wheel-center position and unit spindle axis; see `docs/model-conventions.md`
+/// "Rigid tire envelopes" for the exact geometry and its ambiguous cases.
 fn contact(center: V, axis: V, c: &Corner) -> V {
     let down = V::z() - axis * axis.z;
     let n = down.norm();
@@ -158,6 +189,10 @@ fn contact(center: V, axis: V, c: &Corner) -> V {
         }
     }
 }
+/// Describes a non-unique/non-smooth tire support case for the given tire profile
+/// and unit spindle axis (vertical axle, or a horizontal cylinder axle's camber
+/// cusp), or `None` when the support point is well-defined; surfaced as
+/// [CornerState::contact_ambiguity].
 fn contact_ambiguity(c: &Corner, axis: V) -> Option<String> {
     if axis.z.abs() > 1.0 - 1e-12 {
         Some(
@@ -177,6 +212,11 @@ fn contact_ambiguity(c: &Corner, axis: V) -> Option<String> {
         None
     }
 }
+/// The 6 scalar residuals a solved [Pose] must zero: the upper-front, upper-rear,
+/// lower-front, and lower-rear wishbone link lengths and the tie-rod length (with
+/// commanded rack offset applied to `steering_inner`), each minus its rest length,
+/// followed by the commanded `goal` residual in the last slot. Used both to drive
+/// Newton iteration and, at convergence, as the reported [CornerState::max_residual_m].
 fn residual(c: &Corner, p: &Pose, rack: f64, goal: &Constraint) -> R6 {
     let u = p.point(c, c.upper_ball);
     let l = p.point(c, c.lower_ball);
@@ -211,9 +251,16 @@ fn residual(c: &Corner, p: &Pose, rack: f64, goal: &Constraint) -> R6 {
     };
     r
 }
+/// [newton_tolerance] with the standard 1e-8 m/rad convergence tolerance.
 fn newton(c: &Corner, pose: &mut Pose, rack: f64, goal: &Constraint) -> Result<usize, Error> {
     newton_tolerance(c, pose, rack, goal, 1e-8)
 }
+/// Drives `pose` in place toward zeroing [residual] via damped Gauss-Newton/SVD steps
+/// with backtracking line search, returning the iteration count on convergence.
+/// Detects and rejects the free-rotation-about-a-vertical-kingpin case (an actual
+/// unconstrained DOF, not a numerically isolated toggle) once the link residuals are
+/// satisfied. Errors on a non-finite residual, that underdetermined-steering case, or
+/// exhausting the 80-iteration budget without a step that reduces the residual norm.
 fn newton_tolerance(
     c: &Corner,
     pose: &mut Pose,
@@ -291,6 +338,10 @@ fn newton_tolerance(
     }
     Err(err("kinematic closure iteration limit"))
 }
+/// Signed rotation angle (radians) about the axis `(a, b)` that rigidly carries a
+/// point at design position `rest` to solved position `moved`, both projected
+/// perpendicular to that axis. Used to recover each wishbone's swept angle from its
+/// solved ball-joint position.
 fn arm_angle(a: Point, b: Point, rest: Point, moved: V) -> f64 {
     let axis = (v(b) - v(a)).normalize();
     let r = v(rest) - v(a);
@@ -299,11 +350,19 @@ fn arm_angle(a: Point, b: Point, rest: Point, moved: V) -> f64 {
     let m = m - axis * m.dot(&axis);
     axis.dot(&r.cross(&m)).atan2(r.dot(&m))
 }
+/// Rotates design-pose point `p` by `angle` (radians) about the axis through
+/// `axis[0]`/`axis[1]`, in the direction from the first point to the second.
 fn rotate_axis(p: Point, axis: [Point; 2], angle: f64) -> V {
     v(axis[0])
         + UnitQuaternion::from_axis_angle(&Unit::new_normalize(v(axis[1]) - v(axis[0])), angle)
             * (v(p) - v(axis[0]))
 }
+/// Solves the rocker's single rotation angle about `c.rocker_axis` that places
+/// `c.rocker_pushrod` at the fixed distance `length` from the given pushrod `pickup`
+/// point, picking whichever of the (generally two) solutions is angularly nearest
+/// `previous` (radians) for branch continuity. Errors when the pushrod length does
+/// not constrain the angle (pickup lies on the rocker axis) or the pushrod cannot
+/// reach the rocker at any angle.
 fn rocker(c: &Corner, pickup: V, previous: f64) -> Result<f64, Error> {
     let a = v(c.rocker_axis[0]);
     let axis = (v(c.rocker_axis[1]) - a).normalize();
@@ -340,6 +399,17 @@ fn rocker(c: &Corner, pickup: V, previous: f64) -> Result<f64, Error> {
         b
     })
 }
+/// Builds the reported [CornerState] from a converged [Pose]: derives the wishbone
+/// and rocker angles, the pushrod pickup (following its owning body), and every
+/// solved point/orientation/metric, then re-checks the link and pushrod-length
+/// residuals at strict tolerance. `previous` is the prior rocker angle used for
+/// branch continuity (see [rocker]); `iterations` is only carried through into the
+/// returned [CornerState::iterations].
+///
+/// # Errors
+///
+/// Propagates [rocker]'s error; otherwise returns an error if the rebuilt link or
+/// pushrod-length residual exceeds 1e-8 m (`"link closure exceeds tolerance"`).
 fn state(
     c: &Corner,
     p: &Pose,
@@ -429,6 +499,8 @@ fn state(
         iterations,
     })
 }
+/// [continuation_mode] with motion-ratio measurement enabled; the entry point used
+/// by [solve_corner].
 pub(crate) fn continuation(
     c: &Corner,
     steps: usize,
@@ -436,6 +508,7 @@ pub(crate) fn continuation(
 ) -> Result<CornerState, Error> {
     continuation_mode(c, steps, goal, true)
 }
+/// [continuation_tolerance] with the standard 1e-8 m/rad Newton tolerance.
 pub(crate) fn continuation_mode(
     c: &Corner,
     steps: usize,
@@ -444,6 +517,19 @@ pub(crate) fn continuation_mode(
 ) -> Result<CornerState, Error> {
     continuation_tolerance(c, steps, goal, measure_motion_ratio, 1e-8)
 }
+/// Validates `c`, then closes the corner in `steps` equal sub-goals from the design
+/// pose to `goal(1.0)` (each `goal(t)` giving the rack position and constraint for
+/// continuation parameter `t` in `[0, 1]`), reusing each converged [Pose] as the
+/// initial guess for the next sub-goal so large commanded travel still converges.
+/// When `measure_motion_ratio`, also re-closes the final pose at wheel heights
+/// perturbed by ±1e-5 m (chassis/rack held fixed) to fill [crate::Metrics::motion_ratio]
+/// by central difference, leaving it `None` rather than propagating an error if
+/// either perturbation fails to close.
+///
+/// # Errors
+///
+/// Propagates [Corner::validate]'s, [newton_tolerance]'s, and [state]'s errors from
+/// any sub-goal step.
 pub(crate) fn continuation_tolerance(
     c: &Corner,
     steps: usize,
@@ -495,6 +581,19 @@ pub(crate) fn continuation_tolerance(
 /// chassis (positive raises the wheel center) and rack travel along `c.rack_axis`,
 /// both metres. Uses quaternion tangent-space Newton-Raphson with continuation from
 /// the design pose for large travel. Returned points are in the chassis frame.
+///
+/// # Errors
+///
+/// Returns [Error] if: `jounce` or `rack` is not finite; the commanded travel would
+/// require more than 10000 continuation steps (each step subdivides at most 0.01 m/step
+/// of the larger of `jounce`/`rack`); [Corner::validate] fails for `c`; a closure
+/// residual becomes non-finite; the linkage cannot reach the commanded pose
+/// (`"kinematic closure stalled or travel unreachable"`) or fails to converge within
+/// the iteration budget; the corner is underdetermined — free rotation about a
+/// vertical kingpin with an axial inner tie joint, or a pushrod/rocker geometry whose
+/// length does not constrain the rocker angle; the pushrod cannot reach the rocker at
+/// the commanded pose; or the converged solution's link-length/goal residual exceeds
+/// the solver's tolerance. This function does not panic.
 ///
 /// ```rust
 /// use fky_lapsim_core::{solve_corner, Project};

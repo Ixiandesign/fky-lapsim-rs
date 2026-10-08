@@ -1,11 +1,21 @@
 //! Prescribed vehicle-level motion: commands chassis heave/roll/pitch/rack and solves
 //! all four corners together, on a flat or per-corner road.
+//!
+//! This is prescribed-motion kinematics, not equilibrium or dynamics: no forces are
+//! solved here, and a returned [VehicleState] only means the commanded pose closed
+//! within tolerance, not that it is reachable under load. [simulate]/[simulate_on_road]
+//! solve one [Motion]; [sweep] and [detailed_sweep] solve many, retaining every
+//! failure rather than filtering it out. [motion_grid] builds bounded, deterministic
+//! batches of [Motion] for those sweeps. See the "Commanded motion" section of
+//! <https://github.com/Ixiandesign/FKY-LAPSIM/blob/main/docs/model-conventions.md>
+//! for the sign conventions and finite-rotation order used below.
 pub use crate::motion_grid::{motion_grid, AxisRange, GridMode, MotionGrid};
 use crate::{CornerState, Error, Project};
 use serde::{Deserialize, Serialize};
 /// Commanded chassis/rack motion for [simulate]/[simulate_on_road]/[sweep]. The finite
 /// chassis rotation is `Ry(pitch) * Rx(roll)` about the chassis center of mass, so
-/// roll and pitch are not interchangeable Euler components.
+/// roll and pitch are not interchangeable Euler components. `Motion::default()` is the
+/// design pose: zero heave/roll/pitch/rack, identical to the as-supplied static geometry.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Motion {
     /// Chassis heave, metres; positive lifts the chassis.
@@ -52,7 +62,10 @@ pub struct DetailedSample {
 }
 
 /// Analyze every requested motion without discarding failed states. Use [sweep]
-/// when only basic geometry is needed; derivatives add closure evaluations.
+/// when only basic geometry is needed; derivatives add closure evaluations. Never
+/// errors itself: a motion that fails to solve or analyze is recorded as a
+/// [DetailedSample] with `analysis: None` and `sample.error` set, alongside every
+/// motion that succeeded, so the returned `Vec` always has one entry per input motion.
 pub fn detailed_sweep(p: &Project, motions: &[Motion]) -> Vec<DetailedSample> {
     motions
         .iter()
@@ -78,10 +91,47 @@ pub fn detailed_sweep(p: &Project, motions: &[Motion]) -> Vec<DetailedSample> {
 }
 /// Solve all four corners for `m` on a flat (zero-height) road. Equivalent to
 /// `simulate_on_road(p, m, [0.0; 4])`.
+///
+/// # Errors
+///
+/// Returns an [Error] when: `p.validate()` fails (invalid schema, chassis, corner, or
+/// interconnect configuration); any component of `m` is not finite; the continuation
+/// work implied by `m`'s magnitude exceeds 10,000 steps; or any individual corner
+/// fails to close its linkage within tolerance (the message is prefixed with that
+/// corner's [crate::CornerId]).
+///
+/// # Examples
+///
+/// ```
+/// use fky_lapsim_core::{simulate, Motion, Project};
+///
+/// # fn main() -> Result<(), fky_lapsim_core::Error> {
+/// let project = Project::example();
+/// project.validate()?;
+/// let motion = Motion {
+///     heave: 0.01,
+///     roll: 1.0_f64.to_radians(),
+///     ..Motion::default()
+/// };
+/// let state = simulate(&project, &motion)?;
+/// for corner in &state.corners {
+///     println!("{:?}: camber={} deg", corner.id, corner.metrics.camber_deg);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn simulate(p: &Project, m: &Motion) -> Result<VehicleState, Error> {
     simulate_on_road(p, m, [0.0; 4])
 }
-/// Horizontal road heights in project corner array order. Chassis motion remains absolute.
+/// Solve all four corners for `m`, closing each corner's tire onto its own horizontal
+/// road height (in project corner array order) instead of a single flat road. Chassis
+/// motion remains absolute: `road_heights` shifts only where each tire closes, not the
+/// commanded chassis pose itself.
+///
+/// # Errors
+///
+/// Same conditions as [simulate], plus: any `road_heights` entry is not finite. The
+/// continuation work estimate also grows with the largest `road_heights` magnitude.
 pub fn simulate_on_road(
     p: &Project,
     m: &Motion,
@@ -170,6 +220,27 @@ pub(crate) fn simulate_on_road_tolerance(
 /// Solve `simulate` for every requested motion, retaining each result (or error)
 /// rather than filtering failures out. Inspect `Sample::error` before assessing a
 /// study's feasibility.
+///
+/// # Examples
+///
+/// ```
+/// use fky_lapsim_core::{sweep, Motion, Project};
+///
+/// let project = Project::example();
+/// let motions = [
+///     Motion::default(),
+///     Motion { heave: 0.02, ..Motion::default() },
+/// ];
+/// let samples = sweep(&project, &motions);
+/// assert_eq!(samples.len(), motions.len());
+/// for sample in &samples {
+///     if let Some(state) = &sample.state {
+///         println!("{:?}: {} corners solved", sample.motion, state.corners.len());
+///     } else {
+///         println!("{:?}: {}", sample.motion, sample.error.as_deref().unwrap_or("unknown"));
+///     }
+/// }
+/// ```
 pub fn sweep(p: &Project, m: &[Motion]) -> Vec<Sample> {
     m.iter()
         .map(|m| match simulate(p, m) {
